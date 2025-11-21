@@ -1,2 +1,449 @@
-# nitro-dispatch
-A fast event dispatch and plugin-in module for any Python project
+# Nitro Dispatch
+
+A powerful, framework-agnostic plugin system for Python with advanced features like async/await support, hook priorities, timeouts, event namespacing, and plugin discovery.
+
+## Features
+
+### Core Features
+- **Simple API** - Easy to learn with minimal boilerplate
+- **Framework Agnostic** - Works with any Python application
+- **Hook System** - Register callbacks for custom events with `@hook` decorator
+- **Data Filtering** - Each hook can modify and transform data
+- **Error Isolation** - Plugin errors don't crash your application
+- **Dependency Management** - Automatic dependency resolution
+- **Zero Dependencies** - No external dependencies required
+
+### Advanced Features
+- **Async/Await Support** - Native async hook execution
+- **Hook Priorities** - Control execution order (higher priority = runs first)
+- **Timeout Protection** - Prevent slow plugins from blocking
+- **Event Namespacing** - Organize events hierarchically (`user.login`, `db.save`)
+- **Wildcard Events** - Listen to multiple events (`user.*`, `db.before_*`)
+- **Plugin Discovery** - Auto-discover plugins from directories
+- **Hot Reloading** - Reload plugins without restarting
+- **Stop Propagation** - Halt event chain from within hooks
+- **Hook Tracing** - Debug with detailed execution timing
+- **Built-in Lifecycle Events** - Hook into plugin lifecycle
+- **Metadata Validation** - Ensure plugin quality
+
+## Installation
+
+```bash
+pip install nitro-dispatch
+```
+
+## Quick Start
+
+```python
+from nitro_dispatch import PluginManager, PluginBase, hook
+
+class WelcomePlugin(PluginBase):
+    name = "welcome"
+
+    @hook('user.login', priority=100)
+    def greet_user(self, data):
+        print(f"Welcome, {data['username']}!")
+        data['greeted'] = True
+        return data
+
+manager = PluginManager()
+manager.register(WelcomePlugin)
+manager.load_all()
+
+result = manager.trigger('user.login', {'username': 'Alice'})
+# Output: Welcome, Alice!
+```
+
+## Core Concepts
+
+### 1. Plugins
+
+Plugins inherit from `PluginBase`:
+
+```python
+class MyPlugin(PluginBase):
+    name = "my_plugin"              # Required: unique identifier
+    version = "1.0.0"               # Plugin version
+    description = "Does cool stuff" # Human-readable description
+    author = "Your Name"            # Plugin author
+    dependencies = []               # List of required plugin names
+```
+
+### 2. Hooks
+
+Register callbacks for events using the `@hook` decorator:
+
+```python
+class ValidationPlugin(PluginBase):
+    name = "validator"
+
+    @hook('before_save', priority=100, timeout=5.0)
+    def validate(self, data):
+        if not data.get('email'):
+            raise ValueError("Email required")
+        return data
+```
+
+Or register manually in `on_load()`:
+
+```python
+class LoggingPlugin(PluginBase):
+    name = "logger"
+
+    def on_load(self):
+        self.register_hook('before_save', self.log_data, priority=50)
+
+    def log_data(self, data):
+        print(f"Saving: {data}")
+        return data
+```
+
+### 3. Data Filtering
+
+Hooks execute in priority order (highest first). Each hook receives data, modifies it, and returns it:
+
+```python
+# Hook 1 (priority=100)
+@hook('process_data', priority=100)
+def add_timestamp(self, data):
+    data['timestamp'] = datetime.now()
+    return data
+
+# Hook 2 (priority=50)
+@hook('process_data', priority=50)
+def add_id(self, data):
+    data['id'] = generate_id()
+    return data
+
+# Data flows: original → add_timestamp → add_id → final result
+```
+
+## Advanced Usage
+
+### Hook Priorities
+
+Control execution order with priority values (higher = earlier):
+
+```python
+class SecurityPlugin(PluginBase):
+    @hook('user.login', priority=100)  # Runs first
+    def security_check(self, data):
+        return data
+
+class LoggingPlugin(PluginBase):
+    @hook('user.login', priority=10)  # Runs last
+    def log_login(self, data):
+        return data
+```
+
+### Async/Await Support
+
+Native support for async hooks:
+
+```python
+class AsyncPlugin(PluginBase):
+    @hook('data.fetch')
+    async def fetch_from_api(self, data):
+        result = await aiohttp.get('https://api.example.com')
+        data['result'] = await result.json()
+        return data
+
+# Trigger async
+result = await manager.trigger_async('data.fetch', {})
+```
+
+### Hook Timeouts
+
+Prevent slow plugins from blocking:
+
+```python
+@hook('process_data', timeout=2.0)  # 2 second timeout
+def slow_process(self, data):
+    # If this takes > 2s, HookTimeoutError is raised
+    time.sleep(5)  # This will timeout!
+    return data
+```
+
+### Event Namespacing with Wildcards
+
+Organize events hierarchically and use wildcards:
+
+```python
+class AuditPlugin(PluginBase):
+    @hook('user.*')  # Matches user.login, user.logout, etc.
+    def audit_user_events(self, data):
+        log.info(f"User event: {data}")
+        return data
+
+    @hook('db.before_*')  # Matches db.before_save, db.before_delete
+    def audit_db_operations(self, data):
+        log.info(f"DB operation: {data}")
+        return data
+
+# Trigger events
+manager.trigger('user.login', {})      # Caught by user.*
+manager.trigger('db.before_save', {})  # Caught by db.before_*
+```
+
+### Stop Propagation
+
+Stop the hook chain from within a hook:
+
+```python
+from nitro_dispatch import StopPropagation
+
+class ValidationPlugin(PluginBase):
+    @hook('process_data', priority=100)
+    def validate(self, data):
+        if not data.get('valid'):
+            raise StopPropagation("Invalid data")
+        return data
+
+# Hooks with lower priority won't execute if validation fails
+```
+
+### Plugin Discovery
+
+Auto-discover and load plugins from directories:
+
+```python
+manager = PluginManager()
+
+# Discover plugins from directory
+discovered = manager.discover_plugins(
+    '~/.myapp/plugins',
+    pattern='*_plugin.py',
+    recursive=True
+)
+
+print(f"Discovered: {discovered}")
+manager.load_all()
+```
+
+### Hot Reloading
+
+Reload plugins without restarting:
+
+```python
+# Reload a specific plugin
+manager.reload('my_plugin')
+
+# The plugin will be unloaded, module reloaded, and loaded again
+```
+
+### Enable/Disable Plugins
+
+Toggle plugins at runtime:
+
+```python
+# Disable a plugin (hooks won't execute)
+manager.disable_plugin('optional_plugin')
+
+# Re-enable it
+manager.enable_plugin('optional_plugin')
+```
+
+### Built-in Lifecycle Events
+
+Hook into the plugin system's lifecycle:
+
+```python
+def on_plugin_loaded(data):
+    print(f"Plugin loaded: {data['plugin_name']}")
+    return data
+
+manager.register_hook(
+    PluginManager.EVENT_PLUGIN_LOADED,
+    on_plugin_loaded
+)
+
+# Built-in events:
+# - nitro.plugin.registered
+# - nitro.plugin.loaded
+# - nitro.plugin.unloaded
+# - nitro.plugin.error
+# - nitro.app.startup
+# - nitro.app.shutdown
+```
+
+### Hook Tracing/Debugging
+
+Enable detailed logging for debugging:
+
+```python
+manager = PluginManager(log_level='DEBUG')
+manager.enable_hook_tracing(True)
+
+# Now all hook executions are logged with timing info
+result = manager.trigger('user.login', {})
+```
+
+### Error Handling Strategies
+
+Configure how errors are handled:
+
+```python
+# Log and continue (default)
+manager.set_error_strategy('log_and_continue')
+
+# Stop on first error
+manager.set_error_strategy('fail_fast')
+
+# Collect all errors
+manager.set_error_strategy('collect_all')
+```
+
+### Plugin Configuration
+
+Pass configuration to plugins:
+
+```python
+config = {
+    'cache': {
+        'max_size': 100,
+        'ttl': 3600
+    }
+}
+manager = PluginManager(config=config)
+
+class CachePlugin(PluginBase):
+    name = "cache"
+
+    def on_load(self):
+        max_size = self.get_config('max_size', 50)
+        ttl = self.get_config('ttl', 1800)
+```
+
+## API Reference
+
+### PluginManager
+
+| Method | Description |
+|--------|-------------|
+| `__init__(config, log_level, validate_metadata)` | Initialize manager |
+| `register(plugin_class)` | Register a plugin class |
+| `load(plugin_name)` | Load a specific plugin |
+| `load_all()` | Load all registered plugins |
+| `unload(plugin_name)` | Unload a plugin |
+| `unload_all()` | Unload all plugins |
+| `reload(plugin_name)` | Hot reload a plugin |
+| `discover_plugins(directory, pattern, recursive)` | Auto-discover plugins |
+| `trigger(event, data)` | Trigger event (sync) |
+| `trigger_async(event, data)` | Trigger event (async) |
+| `enable_plugin(name)` | Enable a plugin |
+| `disable_plugin(name)` | Disable a plugin |
+| `enable_hook_tracing(enabled)` | Enable debugging |
+| `set_error_strategy(strategy)` | Set error handling |
+
+### PluginBase
+
+| Attribute/Method | Description |
+|------------------|-------------|
+| `name` | Plugin name (required) |
+| `version` | Plugin version |
+| `description` | Plugin description |
+| `author` | Plugin author |
+| `dependencies` | List of required plugins |
+| `on_load()` | Called when plugin loads |
+| `on_unload()` | Called when plugin unloads |
+| `on_error(error)` | Called on hook errors |
+| `register_hook(event, callback, priority, timeout)` | Register a hook |
+| `get_config(key, default)` | Get configuration value |
+
+### @hook Decorator
+
+```python
+@hook(event_name, priority=50, timeout=None, async_hook=False)
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `event_name` | Event to listen for (supports wildcards) |
+| `priority` | Execution priority (higher = earlier). Default: 50 |
+| `timeout` | Max execution time in seconds. Default: None |
+| `async_hook` | Whether hook is async (auto-detected) |
+
+## Examples
+
+### Basic Usage
+```bash
+python examples/basic_usage.py
+```
+
+### Advanced Features
+```bash
+python examples/advanced_usage.py
+python examples/advanced_features.py
+```
+
+### Plugin Discovery
+```bash
+python examples/discovery_example.py
+```
+
+## Use Cases
+
+- **Web Frameworks** - Middleware, request/response filtering
+- **Data Pipelines** - Transform, validate, enrich data
+- **Event Systems** - Build event-driven architectures
+- **CLI Tools** - Add subcommands and extensions
+- **Testing** - Mock behaviors, inject test data
+- **APIs** - Add authentication, rate limiting, logging
+- **Microservices** - Cross-cutting concerns
+- **Analytics** - Track events and metrics
+
+## Development
+
+### Setup
+```bash
+git clone https://github.com/nitro/nitro-dispatch.git
+cd nitro-dispatch
+pip install -e ".[dev]"
+```
+
+### Run Tests
+```bash
+pytest
+pytest --cov=nitro_dispatch
+```
+
+### Format Code
+```bash
+black nitro_dispatch tests examples
+```
+
+## Requirements
+
+- Python 3.7+
+- No external dependencies
+
+## License
+
+MIT License - see LICENSE file
+
+## Changelog
+
+### 1.0.0 (2025-01-18)
+
+**Initial Release**
+- Plugin registration and loading
+- Hook system with @hook decorator
+- Data filtering support
+- Error isolation
+- Dependency management
+
+**Advanced Features**
+- Async/await hook support
+- Priority-based execution
+- Timeout protection
+- Event namespacing with wildcards
+- Plugin discovery
+- Hot reloading
+- Stop propagation
+- Built-in lifecycle events
+- Hook tracing/debugging
+- Metadata validation
+
+---
+
+Made with ❤️ by the Nitro team
