@@ -2,6 +2,16 @@
 
 A powerful, framework-agnostic plugin system for Python with advanced features like async/await support, hook priorities, timeouts, event namespacing, and plugin discovery.
 
+## Requirements
+
+Python `3.8` or higher is required.
+
+## Installation
+
+```bash
+pip install nitro-dispatch
+```
+
 ## Features
 
 ### Core Features
@@ -25,12 +35,6 @@ A powerful, framework-agnostic plugin system for Python with advanced features l
 - **Hook Tracing** - Debug with detailed execution timing
 - **Built-in Lifecycle Events** - Hook into plugin lifecycle
 - **Metadata Validation** - Ensure plugin quality
-
-## Installation
-
-```bash
-pip install nitro-dispatch
-```
 
 ## Quick Start
 
@@ -318,37 +322,37 @@ class CachePlugin(PluginBase):
 
 ### PluginManager
 
-| Method | Description |
-|--------|-------------|
-| `__init__(config, log_level, validate_metadata)` | Initialize manager |
-| `register(plugin_class)` | Register a plugin class |
-| `load(plugin_name)` | Load a specific plugin |
-| `load_all()` | Load all registered plugins |
-| `unload(plugin_name)` | Unload a plugin |
-| `unload_all()` | Unload all plugins |
-| `reload(plugin_name)` | Hot reload a plugin |
-| `discover_plugins(directory, pattern, recursive)` | Auto-discover plugins |
-| `trigger(event, data)` | Trigger event (sync) |
-| `trigger_async(event, data)` | Trigger event (async) |
-| `enable_plugin(name)` | Enable a plugin |
-| `disable_plugin(name)` | Disable a plugin |
-| `enable_hook_tracing(enabled)` | Enable debugging |
-| `set_error_strategy(strategy)` | Set error handling |
+| Method                                            | Description                 |
+|---------------------------------------------------|-----------------------------|
+| `__init__(config, log_level, validate_metadata)`  | Initialize manager          |
+| `register(plugin_class)`                          | Register a plugin class     |
+| `load(plugin_name)`                               | Load a specific plugin      |
+| `load_all()`                                      | Load all registered plugins |
+| `unload(plugin_name)`                             | Unload a plugin             |
+| `unload_all()`                                    | Unload all plugins          |
+| `reload(plugin_name)`                             | Hot reload a plugin         |
+| `discover_plugins(directory, pattern, recursive)` | Auto-discover plugins       |
+| `trigger(event, data)`                            | Trigger event (sync)        |
+| `trigger_async(event, data)`                      | Trigger event (async)       |
+| `enable_plugin(name)`                             | Enable a plugin             |
+| `disable_plugin(name)`                            | Disable a plugin            |
+| `enable_hook_tracing(enabled)`                    | Enable debugging            |
+| `set_error_strategy(strategy)`                    | Set error handling          |
 
 ### PluginBase
 
-| Attribute/Method | Description |
-|------------------|-------------|
-| `name` | Plugin name (required) |
-| `version` | Plugin version |
-| `description` | Plugin description |
-| `author` | Plugin author |
-| `dependencies` | List of required plugins |
-| `on_load()` | Called when plugin loads |
-| `on_unload()` | Called when plugin unloads |
-| `on_error(error)` | Called on hook errors |
-| `register_hook(event, callback, priority, timeout)` | Register a hook |
-| `get_config(key, default)` | Get configuration value |
+| Attribute/Method                                    | Description                |
+|-----------------------------------------------------|----------------------------|
+| `name`                                              | Plugin name (required)     |
+| `version`                                           | Plugin version             |
+| `description`                                       | Plugin description         |
+| `author`                                            | Plugin author              |
+| `dependencies`                                      | List of required plugins   |
+| `on_load()`                                         | Called when plugin loads   |
+| `on_unload()`                                       | Called when plugin unloads |
+| `on_error(error)`                                   | Called on hook errors      |
+| `register_hook(event, callback, priority, timeout)` | Register a hook            |
+| `get_config(key, default)`                          | Get configuration value    |
 
 ### @hook Decorator
 
@@ -356,12 +360,12 @@ class CachePlugin(PluginBase):
 @hook(event_name, priority=50, timeout=None, async_hook=False)
 ```
 
-| Parameter | Description |
-|-----------|-------------|
-| `event_name` | Event to listen for (supports wildcards) |
-| `priority` | Execution priority (higher = earlier). Default: 50 |
-| `timeout` | Max execution time in seconds. Default: None |
-| `async_hook` | Whether hook is async (auto-detected) |
+| Parameter    | Description                                        |
+|--------------|----------------------------------------------------|
+| `event_name` | Event to listen for (supports wildcards)           |
+| `priority`   | Execution priority (higher = earlier). Default: 50 |
+| `timeout`    | Max execution time in seconds. Default: None       |
+| `async_hook` | Whether hook is async (auto-detected)              |
 
 ## Examples
 
@@ -380,17 +384,6 @@ python examples/advanced_features.py
 ```bash
 python examples/discovery_example.py
 ```
-
-## Use Cases
-
-- **Web Frameworks** - Middleware, request/response filtering
-- **Data Pipelines** - Transform, validate, enrich data
-- **Event Systems** - Build event-driven architectures
-- **CLI Tools** - Add subcommands and extensions
-- **Testing** - Mock behaviors, inject test data
-- **APIs** - Add authentication, rate limiting, logging
-- **Microservices** - Cross-cutting concerns
-- **Analytics** - Track events and metrics
 
 ## Development
 
@@ -412,38 +405,10 @@ pytest --cov=nitro_dispatch
 black nitro_dispatch tests examples
 ```
 
-## Requirements
-
-- Python 3.7+
-- No external dependencies
-
 ## License
 
-MIT License - see LICENSE file
+Please see [LICENSE](LICENSE) for licensing details.
 
-## Changelog
+## Author
 
-### 1.0.0 (2025-01-18)
-
-**Initial Release**
-- Plugin registration and loading
-- Hook system with @hook decorator
-- Data filtering support
-- Error isolation
-- Dependency management
-
-**Advanced Features**
-- Async/await hook support
-- Priority-based execution
-- Timeout protection
-- Event namespacing with wildcards
-- Plugin discovery
-- Hot reloading
-- Stop propagation
-- Built-in lifecycle events
-- Hook tracing/debugging
-- Metadata validation
-
----
-
-Made with ❤️ by the Nitro team
+[github.com/sn](https://github.com/sn)

@@ -35,7 +35,7 @@ Example:
 """
 
 __version__ = "1.0.0"
-__author__ = "Nitro Dispatch Contributors"
+__author__ = "Sean Nieuwoudt"
 __license__ = "MIT"
 
 from .core import (
