@@ -31,7 +31,7 @@ pip install nitro-dispatch
 - **Wildcard Events** - Listen to multiple events (`user.*`, `db.before_*`)
 - **Plugin Discovery** - Auto-discover plugins from directories
 - **Hot Reloading** - Reload plugins without restarting
-- **Stop Propagation** - Halt event chain from within hooks
+- **Stop Propagation** - Halt an event chain from within hooks
 - **Hook Tracing** - Debug with detailed execution timing
 - **Built-in Lifecycle Events** - Hook into plugin lifecycle
 - **Metadata Validation** - Ensure plugin quality
@@ -322,37 +322,49 @@ class CachePlugin(PluginBase):
 
 ### PluginManager
 
-| Method                                            | Description                 |
-|---------------------------------------------------|-----------------------------|
-| `__init__(config, log_level, validate_metadata)`  | Initialize manager          |
-| `register(plugin_class)`                          | Register a plugin class     |
-| `load(plugin_name)`                               | Load a specific plugin      |
-| `load_all()`                                      | Load all registered plugins |
-| `unload(plugin_name)`                             | Unload a plugin             |
-| `unload_all()`                                    | Unload all plugins          |
-| `reload(plugin_name)`                             | Hot reload a plugin         |
-| `discover_plugins(directory, pattern, recursive)` | Auto-discover plugins       |
-| `trigger(event, data)`                            | Trigger event (sync)        |
-| `trigger_async(event, data)`                      | Trigger event (async)       |
-| `enable_plugin(name)`                             | Enable a plugin             |
-| `disable_plugin(name)`                            | Disable a plugin            |
-| `enable_hook_tracing(enabled)`                    | Enable debugging            |
-| `set_error_strategy(strategy)`                    | Set error handling          |
+| Method                                                      | Description                     |
+|-------------------------------------------------------------|---------------------------------|
+| `__init__(config, log_level, validate_metadata)`            | Initialize manager              |
+| `register(plugin_class)`                                    | Register a plugin class         |
+| `unregister(plugin_name)`                                   | Unregister and unload a plugin  |
+| `load(plugin_name)`                                         | Load a specific plugin          |
+| `load_all()`                                                | Load all registered plugins     |
+| `unload(plugin_name)`                                       | Unload a plugin                 |
+| `unload_all()`                                              | Unload all plugins              |
+| `reload(plugin_name)`                                       | Hot reload a plugin             |
+| `discover_plugins(directory, pattern, recursive)`           | Auto-discover plugins           |
+| `register_hook(event, callback, plugin, priority, timeout)` | Register a hook manually        |
+| `unregister_hook(event, callback, plugin)`                  | Unregister a hook               |
+| `trigger(event, data)`                                      | Trigger event (sync)            |
+| `trigger_async(event, data)`                                | Trigger event (async)           |
+| `get_plugin(name)`                                          | Get a loaded plugin by name     |
+| `get_all_plugins()`                                         | Get all loaded plugins          |
+| `get_registered_plugins()`                                  | Get names of registered plugins |
+| `get_loaded_plugins()`                                      | Get names of loaded plugins     |
+| `is_loaded(plugin_name)`                                    | Check if a plugin is loaded     |
+| `get_events()`                                              | Get all registered event names  |
+| `enable_plugin(name)`                                       | Enable a plugin                 |
+| `disable_plugin(name)`                                      | Disable a plugin                |
+| `enable_hook_tracing(enabled)`                              | Enable debugging                |
+| `set_error_strategy(strategy)`                              | Set error handling              |
 
 ### PluginBase
 
-| Attribute/Method                                    | Description                |
-|-----------------------------------------------------|----------------------------|
-| `name`                                              | Plugin name (required)     |
-| `version`                                           | Plugin version             |
-| `description`                                       | Plugin description         |
-| `author`                                            | Plugin author              |
-| `dependencies`                                      | List of required plugins   |
-| `on_load()`                                         | Called when plugin loads   |
-| `on_unload()`                                       | Called when plugin unloads |
-| `on_error(error)`                                   | Called on hook errors      |
-| `register_hook(event, callback, priority, timeout)` | Register a hook            |
-| `get_config(key, default)`                          | Get configuration value    |
+| Attribute/Method                                    | Description                      |
+|-----------------------------------------------------|----------------------------------|
+| `name`                                              | Plugin name (required)           |
+| `version`                                           | Plugin version                   |
+| `description`                                       | Plugin description               |
+| `author`                                            | Plugin author                    |
+| `dependencies`                                      | List of required plugins         |
+| `enabled`                                           | Whether the plugin is enabled    |
+| `on_load()`                                         | Called when plugin loads         |
+| `on_unload()`                                       | Called when plugin unloads       |
+| `on_error(error)`                                   | Called on hook errors            |
+| `register_hook(event, callback, priority, timeout)` | Register a hook                  |
+| `unregister_hook(event, callback)`                  | Unregister a hook                |
+| `trigger(event, data)`                              | Trigger an event from the plugin |
+| `get_config(key, default)`                          | Get configuration value          |
 
 ### @hook Decorator
 
@@ -366,6 +378,37 @@ class CachePlugin(PluginBase):
 | `priority`   | Execution priority (higher = earlier). Default: 50 |
 | `timeout`    | Max execution time in seconds. Default: None       |
 | `async_hook` | Whether hook is async (auto-detected)              |
+
+### Exceptions
+
+All exceptions inherit from `NitroPluginError`:
+
+| Exception               | Description                                  |
+|-------------------------|----------------------------------------------|
+| `NitroPluginError`      | Base exception for all Nitro Plugin errors   |
+| `PluginLoadError`       | Raised when a plugin fails to load           |
+| `PluginRegistrationError` | Raised when plugin registration fails      |
+| `PluginNotFoundError`   | Raised when a requested plugin is not found  |
+| `PluginDiscoveryError`  | Raised when plugin discovery fails           |
+| `DependencyError`       | Raised when plugin dependencies cannot be resolved |
+| `HookError`             | Raised when hook execution fails             |
+| `HookTimeoutError`      | Raised when a hook exceeds its timeout       |
+| `ValidationError`       | Raised when plugin metadata validation fails |
+| `StopPropagation`       | Raised to stop hook propagation in the event chain |
+
+```python
+from nitro_dispatch import (
+    NitroPluginError,
+    PluginLoadError,
+    HookTimeoutError,
+    StopPropagation,
+)
+
+try:
+    manager.load('my_plugin')
+except PluginLoadError as e:
+    print(f"Failed to load plugin: {e}")
+```
 
 ## Examples
 
