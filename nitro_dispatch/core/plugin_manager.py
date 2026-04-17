@@ -336,7 +336,19 @@ class PluginManager:
             module_name = plugin_class.__module__
             if module_name in sys.modules:
                 logger.debug(f"Reloading module '{module_name}'")
-                importlib.reload(sys.modules[module_name])
+                reloaded_module = importlib.reload(sys.modules[module_name])
+
+                # importlib.reload replaces the module's classes with new
+                # objects. Refresh our stored class reference so the subsequent
+                # load() instantiates the new code, not the pre-reload class.
+                for _, obj in inspect.getmembers(reloaded_module, inspect.isclass):
+                    if (
+                        issubclass(obj, PluginBase)
+                        and obj is not PluginBase
+                        and obj().name == plugin_name
+                    ):
+                        self._plugin_classes[plugin_name] = obj
+                        break
 
         # Load the plugin
         return self.load(plugin_name)
@@ -399,9 +411,10 @@ class PluginManager:
                             ):
 
                                 self.register(obj)
-                                discovered.append(obj().name)
+                                plugin_name = obj().name
+                                discovered.append(plugin_name)
                                 logger.debug(
-                                    f"Discovered plugin '{obj().name}' from " f"{plugin_file}"
+                                    f"Discovered plugin '{plugin_name}' from {plugin_file}"
                                 )
 
                 except Exception as e:

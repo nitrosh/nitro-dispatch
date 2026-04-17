@@ -2,7 +2,7 @@ include README.md
 include LICENSE
 include pyproject.toml
 include setup.py
-recursive-include nitro_plugins *.py
+recursive-include nitro_dispatch *.py
 recursive-include examples *.py
 recursive-include tests *.py
 global-exclude __pycache__

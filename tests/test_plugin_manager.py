@@ -403,6 +403,100 @@ def test_reload_nonexistent_plugin(manager):
         manager.reload("nonexistent")
 
 
+def test_reload_picks_up_source_changes(manager):
+    """Regression: reload() must re-read the module and use the new class.
+
+    Previously, reload() called importlib.reload() but then instantiated the
+    stale class reference captured at register-time, so source edits were
+    silently ignored.
+    """
+    import sys
+    import importlib
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        plugin_dir = Path(temp_dir)
+        plugin_file = plugin_dir / "reloadable_plugin.py"
+
+        v1 = """
+from nitro_dispatch import PluginBase, hook
+
+class ReloadablePlugin(PluginBase):
+    name = "reloadable"
+    version = "1.0.0"
+
+    @hook('ping')
+    def respond(self, data):
+        data['version'] = 'v1'
+        return data
+"""
+        plugin_file.write_text(v1)
+
+        sys.path.insert(0, str(plugin_dir))
+        try:
+            module = importlib.import_module("reloadable_plugin")
+            manager.register(module.ReloadablePlugin)
+            manager.load("reloadable")
+            assert manager.trigger("ping", {})["version"] == "v1"
+
+            v2 = v1.replace("'v1'", "'v2'")
+            plugin_file.write_text(v2)
+            # Bump mtime past filesystem's 1s resolution so importlib doesn't
+            # treat the cached bytecode as still-fresh.
+            import os
+            future = plugin_file.stat().st_mtime + 2
+            os.utime(plugin_file, (future, future))
+
+            manager.reload("reloadable")
+            assert manager.trigger("ping", {})["version"] == "v2"
+        finally:
+            sys.path.remove(str(plugin_dir))
+            sys.modules.pop("reloadable_plugin", None)
+
+
+@pytest.mark.asyncio
+async def test_trigger_async_sync_hook_with_timeout(manager):
+    """Regression: a sync hook with a timeout must work under trigger_async().
+
+    Previously, _execute_hook_with_timeout used signal.SIGALRM which raises
+    ValueError outside the main thread — and trigger_async() dispatches sync
+    hooks to a thread pool executor, so any sync hook with timeout=... would
+    fail unconditionally (never timing out, just erroring) on POSIX, and fail
+    on Windows regardless.
+    """
+    import time
+
+    class FastSyncPlugin(PluginBase):
+        name = "fast_sync"
+
+        @hook("fast_event", timeout=1.0)
+        def fast(self, data):
+            data["ran"] = True
+            return data
+
+    manager.register(FastSyncPlugin)
+    manager.load("fast_sync")
+
+    result = await manager.trigger_async("fast_event", {})
+    assert result["ran"] is True
+
+    class SlowSyncPlugin(PluginBase):
+        name = "slow_sync"
+
+        @hook("slow_event", timeout=0.1)
+        def slow(self, data):
+            time.sleep(1.0)
+            return data
+
+    manager.register(SlowSyncPlugin)
+    manager.load("slow_sync")
+    manager._registry.set_error_strategy("fail_fast")
+
+    from nitro_dispatch.core.exceptions import HookError
+
+    with pytest.raises(HookError):
+        await manager.trigger_async("slow_event", {})
+
+
 def test_set_error_strategy(manager):
     """Test setting error handling strategy."""
     manager.set_error_strategy("fail_fast")

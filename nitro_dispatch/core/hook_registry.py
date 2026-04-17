@@ -3,19 +3,14 @@ Hook registry for managing event subscriptions and triggers.
 """
 
 import asyncio
+import concurrent.futures
 import re
-import signal
 from typing import Any, Callable, Dict, List, Optional
 import logging
 
 from .exceptions import HookError, StopPropagation, HookTimeoutError
 
 logger = logging.getLogger(__name__)
-
-
-def timeout_handler(signum, frame):
-    """Signal handler for hook timeout."""
-    raise HookTimeoutError("Hook execution exceeded timeout")
 
 
 class HookRegistry:
@@ -170,25 +165,18 @@ class HookRegistry:
         if timeout is None:
             return callback(data)
 
-        # Use signal-based timeout for synchronous code
-        try:
-            # Set timeout signal
-            old_handler = signal.signal(signal.SIGALRM, timeout_handler)
-            signal.setitimer(signal.ITIMER_REAL, timeout)
-
+        # Thread-based timeout: portable (works on Windows and in non-main
+        # threads, unlike signal.SIGALRM) and safe to call from executors.
+        # Note: the worker thread cannot be forcibly killed on timeout — this
+        # matches asyncio.wait_for's behavior for async hooks.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(callback, data)
             try:
-                result = callback(data)
-            finally:
-                # Cancel the timer
-                signal.setitimer(signal.ITIMER_REAL, 0)
-                signal.signal(signal.SIGALRM, old_handler)
-
-            return result
-        except HookTimeoutError:
-            raise
-        except Exception:
-            # Re-raise other exceptions
-            raise
+                return future.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                raise HookTimeoutError(
+                    f"Hook execution exceeded timeout of {timeout}s"
+                )
 
     async def _execute_async_hook_with_timeout(
         self, callback: Callable, data: Any, timeout: Optional[float]

@@ -4,21 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nitro-dispatch"
-version = "1.0.0"
+version = "1.0.1"
 description = "A powerful, framework-agnostic plugin system for Python with advanced features like async/await support, hook priorities, timeouts, event namespacing, and plugin discovery."
 readme = "README.md"
 authors = [
     { name = "Sean Nieuwoudt", email = "sean@nitro.sh" }
 ]
 license = { text = "MIT" }
-requires-python = ">=3.7"
+requires-python = ">=3.9"
 classifiers = [
     "Operating System :: OS Independent",
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.7",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -43,10 +41,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/nitro/nitro-dispatch"
-Documentation = "https://github.com/nitro/nitro-dispatch/blob/main/README.md"
-Repository = "https://github.com/nitro/nitro-dispatch"
-Issues = "https://github.com/nitro/nitro-dispatch/issues"
+Homepage = "https://github.com/nitrosh/nitro-dispatch"
+Documentation = "https://github.com/nitrosh/nitro-dispatch/blob/main/README.md"
+Repository = "https://github.com/nitrosh/nitro-dispatch"
+Issues = "https://github.com/nitrosh/nitro-dispatch/issues"
 
 [tool.setuptools]
 packages = ["nitro_dispatch", "nitro_dispatch.core", "nitro_dispatch.utils"]
@@ -56,7 +54,7 @@ nitro_dispatch = ["py.typed"]
 
 [tool.black]
 line-length = 100
-target-version = ['py37', 'py38', 'py39', 'py310', 'py311', 'py312', 'py313', 'py314']
+target-version = ['py39', 'py310', 'py311', 'py312', 'py313', 'py314']
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -65,7 +63,7 @@ python_classes = ["Test*"]
 python_functions = ["test_*"]
 
 [tool.mypy]
-python_version = "3.7"
+python_version = "3.9"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false

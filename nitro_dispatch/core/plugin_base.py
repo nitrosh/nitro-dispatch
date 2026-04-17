@@ -30,6 +30,13 @@ class PluginBase:
         self._manager: Optional[Any] = None
         self._hooks: Dict[str, List[callable]] = {}
 
+        # Shadow the class-level mutable list with a per-instance copy so
+        # subclasses that mutate self.dependencies don't leak into siblings.
+        # Only shadow when the class value is actually a list — otherwise
+        # leave the invalid type intact for metadata validation to surface.
+        if isinstance(self.__class__.dependencies, list):
+            self.dependencies = list(self.__class__.dependencies)
+
         # Only auto-name if name was not explicitly defined in the plugin class
         # Check if 'name' is in the class's own __dict__ (not inherited from
         # PluginBase)

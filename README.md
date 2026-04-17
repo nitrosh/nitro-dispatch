@@ -4,7 +4,7 @@ A powerful, framework-agnostic plugin system for Python with advanced features l
 
 ## Requirements
 
-Python `3.8` or higher is required.
+Python `3.9` or higher is required.
 
 ## Installation
 
@@ -432,7 +432,7 @@ python examples/discovery_example.py
 
 ### Setup
 ```bash
-git clone https://github.com/nitro/nitro-dispatch.git
+git clone https://github.com/nitrosh/nitro-dispatch.git
 cd nitro-dispatch
 pip install -e ".[dev]"
 ```
@@ -448,10 +448,14 @@ pytest --cov=nitro_dispatch
 black nitro_dispatch tests examples
 ```
 
+## Ecosystem
+
+- **[nitro-cli](https://github.com/nitrosh/nitro-cli)** - Python-powered static site generator
+- **[nitro-ui](https://github.com/nitrosh/nitro-ui)** - Build HTML with Python, not strings
+- **[nitro-datastore](https://github.com/nitrosh/nitro-datastore)** - Schema-free JSON data store with dot notation access
+- **[nitro-image](https://github.com/nitrosh/nitro-image)** - Fast, friendly image processing for the web
+- **[nitro-validate](https://github.com/nitrosh/nitro-validate)** - Dependency-free data validation
+
 ## License
 
 Please see [LICENSE](LICENSE) for licensing details.
-
-## Author
-
-[github.com/sn](https://github.com/sn)

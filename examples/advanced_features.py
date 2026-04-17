@@ -3,14 +3,14 @@ Advanced features demonstration for Nitro Dispatch.
 
 This example demonstrates:
 1. Hook priorities
-2. Async hooks
-3. Hook timeouts
-4. Event namespacing with wildcards
-5. Stop propagation
-6. Plugin discovery
-7. Hot reloading
-8. Built-in lifecycle events
-9. Hook tracing/debugging
+2. Event namespacing with wildcards
+3. Stop propagation
+4. Enable/disable plugins
+5. Hook tracing/debugging
+6. Built-in lifecycle events
+7. Async hooks
+
+See `discovery_example.py` for plugin discovery and hot reloading.
 """
 
 import asyncio
@@ -72,25 +72,7 @@ class AsyncPlugin(PluginBase):
 
 
 # ============================================================================
-# Feature 3: Hook Timeouts
-# ============================================================================
-class TimeoutPlugin(PluginBase):
-    """Demonstrates hook timeout protection."""
-
-    name = "timeout_plugin"
-    version = "1.0.0"
-
-    @hook("process.data", timeout=2.0)  # 2 second timeout
-    def fast_process(self, data):
-        """Fast processing with timeout."""
-        print(f"[{self.name}] Processing quickly...")
-        time.sleep(0.5)  # Simulates processing
-        data["processed"] = True
-        return data
-
-
-# ============================================================================
-# Feature 4: Event Namespacing with Wildcards
+# Feature 3: Event Namespacing with Wildcards
 # ============================================================================
 class WildcardPlugin(PluginBase):
     """Demonstrates wildcard event matching."""
@@ -114,7 +96,7 @@ class WildcardPlugin(PluginBase):
 
 
 # ============================================================================
-# Feature 5: Stop Propagation
+# Feature 4: Stop Propagation
 # ============================================================================
 class ValidationPlugin(PluginBase):
     """Demonstrates stopping hook propagation."""
@@ -148,7 +130,7 @@ class PostValidationPlugin(PluginBase):
 
 
 # ============================================================================
-# Feature 6: Enable/Disable Plugins
+# Feature 5: Enable/Disable Plugins
 # ============================================================================
 class OptionalPlugin(PluginBase):
     """Plugin that can be disabled at runtime."""
@@ -182,7 +164,7 @@ def demo_priorities():
 async def demo_async():
     """Demonstrate async hooks."""
     print("\n" + "=" * 60)
-    print("DEMO 2: Async Hooks")
+    print("DEMO 7: Async Hooks")
     print("=" * 60)
 
     manager = PluginManager()
@@ -196,7 +178,7 @@ async def demo_async():
 def demo_wildcards():
     """Demonstrate wildcard event matching."""
     print("\n" + "=" * 60)
-    print("DEMO 3: Event Namespacing with Wildcards")
+    print("DEMO 2: Event Namespacing with Wildcards")
     print("=" * 60)
 
     manager = PluginManager()
@@ -218,7 +200,7 @@ def demo_wildcards():
 def demo_stop_propagation():
     """Demonstrate stop propagation."""
     print("\n" + "=" * 60)
-    print("DEMO 4: Stop Propagation")
+    print("DEMO 3: Stop Propagation")
     print("=" * 60)
 
     manager = PluginManager()
@@ -238,7 +220,7 @@ def demo_stop_propagation():
 def demo_enable_disable():
     """Demonstrate enable/disable plugins."""
     print("\n" + "=" * 60)
-    print("DEMO 5: Enable/Disable Plugins")
+    print("DEMO 4: Enable/Disable Plugins")
     print("=" * 60)
 
     manager = PluginManager()
@@ -267,7 +249,7 @@ def demo_enable_disable():
 def demo_hook_tracing():
     """Demonstrate hook tracing for debugging."""
     print("\n" + "=" * 60)
-    print("DEMO 6: Hook Tracing (Debugging)")
+    print("DEMO 5: Hook Tracing (Debugging)")
     print("=" * 60)
 
     manager = PluginManager(log_level="DEBUG")
@@ -284,7 +266,7 @@ def demo_hook_tracing():
 def demo_built_in_events():
     """Demonstrate built-in lifecycle events."""
     print("\n" + "=" * 60)
-    print("DEMO 7: Built-in Lifecycle Events")
+    print("DEMO 6: Built-in Lifecycle Events")
     print("=" * 60)
 
     manager = PluginManager()
@@ -323,9 +305,6 @@ def main():
     demo_built_in_events()
 
     # Run async demo
-    print("\n" + "=" * 60)
-    print("DEMO 2: Async Hooks (Running async demo)")
-    print("=" * 60)
     asyncio.run(demo_async())
 
     print("\n" + "=" * 70)
