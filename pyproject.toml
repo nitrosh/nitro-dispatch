@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nitro-dispatch"
-version = "1.0.1"
+version = "1.0.2"
 description = "A powerful, framework-agnostic plugin system for Python with advanced features like async/await support, hook priorities, timeouts, event namespacing, and plugin discovery."
 readme = "README.md"
 authors = [

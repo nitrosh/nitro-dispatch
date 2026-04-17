@@ -1,6 +1,4 @@
-"""
-Plugin manager for orchestrating plugin lifecycle and hooks.
-"""
+"""Plugin manager that orchestrates plugin lifecycle and hook dispatch."""
 
 import importlib
 import importlib.util
@@ -25,21 +23,39 @@ logger = logging.getLogger(__name__)
 
 
 class PluginManager:
-    """
-    Central orchestrator for managing plugins and their lifecycle.
+    """Central orchestrator for plugin lifecycle and event dispatch.
 
-    The PluginManager handles:
-    - Plugin registration and loading
-    - Hook management and event triggering (sync and async)
-    - Dependency resolution
-    - Plugin configuration
-    - Error handling and isolation
-    - Plugin discovery from directories
-    - Hot reloading
-    - Metadata validation
+    The manager is the primary entry point for application code. It
+    registers plugin classes, instantiates them in dependency order,
+    forwards their hooks into an internal :class:`HookRegistry`, and
+    exposes :meth:`trigger` / :meth:`trigger_async` to dispatch events.
+
+    Typical workflow: ``register(cls)`` → ``load(name)`` (or
+    ``load_all()``) → ``trigger(event, data)``. Plugins can also be
+    auto-discovered from a directory with :meth:`discover_plugins` and
+    hot-swapped during development with :meth:`reload`.
+
+    Built-in lifecycle events (exposed as class constants) fire at
+    registration, load, unload, and error, plus application-level
+    ``EVENT_APP_STARTUP`` / ``EVENT_APP_SHUTDOWN`` that callers can
+    trigger themselves.
+
+    Example:
+        >>> from nitro_dispatch import PluginManager, PluginBase, hook
+        >>> class Greeter(PluginBase):
+        ...     name = "greeter"
+        ...     @hook("user.login")
+        ...     def greet(self, data):
+        ...         data["greeted"] = True
+        ...         return data
+        >>> mgr = PluginManager()
+        >>> mgr.register(Greeter)
+        >>> mgr.load_all()
+        ['greeter']
+        >>> mgr.trigger("user.login", {"user": "alice"})
+        {'user': 'alice', 'greeted': True}
     """
 
-    # Built-in lifecycle events
     EVENT_PLUGIN_REGISTERED = "nitro.plugin.registered"
     EVENT_PLUGIN_LOADED = "nitro.plugin.loaded"
     EVENT_PLUGIN_UNLOADED = "nitro.plugin.unloaded"
@@ -52,15 +68,21 @@ class PluginManager:
         config: Optional[Dict[str, Any]] = None,
         log_level: str = "INFO",
         validate_metadata: bool = True,
-    ):
-        """
-        Initialize the plugin manager.
+    ) -> None:
+        """Initialize the manager.
 
         Args:
-            config: Optional configuration dictionary for plugins
-            log_level: Logging level (DEBUG, INFO, WARNING, ERROR)
-            validate_metadata: Whether to validate plugin metadata on
-                registration
+            config: Optional per-plugin configuration, keyed by plugin
+                name. Exposed to plugins via
+                :meth:`PluginBase.get_config`.
+            log_level: Root logging level applied via
+                ``logging.basicConfig``. Accepts the usual names
+                (``DEBUG``, ``INFO``, ``WARNING``, ``ERROR``).
+            validate_metadata: When True (default), every registered
+                plugin has its ``name``, ``version``, and
+                ``dependencies`` attributes validated. Disable for
+                prototyping or when registering dynamically generated
+                classes.
         """
         self._registry = HookRegistry()
         self._plugins: Dict[str, PluginBase] = {}
@@ -69,29 +91,41 @@ class PluginManager:
         self._loaded: bool = False
         self._validate_metadata: bool = validate_metadata
 
-        # Configure logging
         logging.basicConfig(level=getattr(logging, log_level.upper()))
 
     def register(self, plugin_class: Type[PluginBase], validate: bool = True) -> None:
-        """
-        Register a plugin class.
+        """Register a plugin class so it can later be loaded.
+
+        Registration stores the class — no instance is kept. The class is
+        instantiated once temporarily to read its ``name`` and validate
+        metadata. Registering a name that already exists overwrites the
+        previous registration and logs a warning.
+
+        Triggers ``EVENT_PLUGIN_REGISTERED`` on success.
 
         Args:
-            plugin_class: Plugin class that inherits from PluginBase
-            validate: Whether to validate plugin metadata
+            plugin_class: A subclass of :class:`PluginBase`.
+            validate: Per-call override for metadata validation. When
+                False, skips validation even if the manager was created
+                with ``validate_metadata=True``.
 
         Raises:
-            PluginRegistrationError: If registration fails
-            ValidationError: If metadata validation fails
+            PluginRegistrationError: If ``plugin_class`` does not inherit
+                from :class:`PluginBase`.
+            ValidationError: If metadata validation is enabled and the
+                plugin's ``name``, ``version``, or ``dependencies`` are
+                invalid.
+
+        Example:
+            >>> mgr = PluginManager()
+            >>> mgr.register(MyPlugin)
         """
         if not issubclass(plugin_class, PluginBase):
             raise PluginRegistrationError(f"{plugin_class.__name__} must inherit from PluginBase")
 
-        # Create temporary instance to get name and validate
         temp_instance = plugin_class()
         plugin_name = temp_instance.name
 
-        # Validate metadata if enabled
         if validate and self._validate_metadata:
             self._validate_plugin_metadata(temp_instance)
 
@@ -101,22 +135,13 @@ class PluginManager:
         self._plugin_classes[plugin_name] = plugin_class
         logger.info(f"Registered plugin class '{plugin_name}' v{temp_instance.version}")
 
-        # Trigger lifecycle event
         self.trigger(
             self.EVENT_PLUGIN_REGISTERED,
             {"plugin_name": plugin_name, "version": temp_instance.version},
         )
 
     def _validate_plugin_metadata(self, plugin: PluginBase) -> None:
-        """
-        Validate plugin metadata.
-
-        Args:
-            plugin: Plugin instance to validate
-
-        Raises:
-            ValidationError: If validation fails
-        """
+        """Validate ``name``, ``version``, and ``dependencies`` on an instance."""
         if not plugin.name or not isinstance(plugin.name, str):
             raise ValidationError("Plugin must have a valid 'name' attribute")
 
@@ -129,19 +154,17 @@ class PluginManager:
         logger.debug(f"Plugin '{plugin.name}' metadata validated successfully")
 
     def unregister(self, plugin_name: str) -> None:
-        """
-        Unregister and unload a plugin.
+        """Remove a plugin's registration, unloading it first if needed.
 
         Args:
-            plugin_name: Name of the plugin to unregister
+            plugin_name: Name of the plugin to remove.
 
         Raises:
-            PluginNotFoundError: If plugin is not found
+            PluginNotFoundError: If the plugin is not registered.
         """
         if plugin_name not in self._plugin_classes:
             raise PluginNotFoundError(f"Plugin '{plugin_name}' not found")
 
-        # Unload if loaded
         if plugin_name in self._plugins:
             self.unload(plugin_name)
 
@@ -149,19 +172,28 @@ class PluginManager:
         logger.info(f"Unregistered plugin '{plugin_name}'")
 
     def load(self, plugin_name: str) -> PluginBase:
-        """
-        Load a specific plugin.
+        """Instantiate a registered plugin and attach its hooks.
+
+        Loading recursively loads every name in the plugin's
+        ``dependencies`` first, then instantiates the target class, wires
+        up its decorated hooks, and calls :meth:`PluginBase.on_load`.
+        If the plugin is already loaded, the existing instance is
+        returned and a warning is logged.
+
+        Triggers ``EVENT_PLUGIN_LOADED`` on success and
+        ``EVENT_PLUGIN_ERROR`` on failure.
 
         Args:
-            plugin_name: Name of the plugin to load
+            plugin_name: Name of a registered plugin.
 
         Returns:
-            Loaded plugin instance
+            The loaded plugin instance.
 
         Raises:
-            PluginNotFoundError: If plugin is not registered
-            PluginLoadError: If loading fails
-            DependencyError: If dependencies cannot be resolved
+            PluginNotFoundError: If the plugin is not registered.
+            PluginLoadError: If instantiation, hook registration, or
+                ``on_load`` raises.
+            DependencyError: If any dependency fails to load.
         """
         if plugin_name not in self._plugin_classes:
             raise PluginNotFoundError(f"Plugin '{plugin_name}' not registered")
@@ -173,11 +205,9 @@ class PluginManager:
         plugin_class = self._plugin_classes[plugin_name]
 
         try:
-            # Create plugin instance
             plugin = plugin_class()
             plugin._manager = self
 
-            # Check and load dependencies
             for dep_name in plugin.dependencies:
                 if dep_name not in self._plugins:
                     logger.info(f"Loading dependency '{dep_name}' for '{plugin_name}'")
@@ -188,11 +218,9 @@ class PluginManager:
                             f"Failed to load dependency '{dep_name}' for " f"'{plugin_name}': {e}"
                         ) from e
 
-            # Register hooks that were stored during initialization
             for event_name, hook_list in plugin._hooks.items():
                 for hook_data in hook_list:
                     if isinstance(hook_data, dict):
-                        # New format with metadata
                         self.register_hook(
                             event_name,
                             hook_data["callback"],
@@ -201,17 +229,15 @@ class PluginManager:
                             hook_data.get("timeout"),
                         )
                     else:
-                        # Old format (just callback)
+                        # Legacy format: bare callable stored without metadata.
                         self.register_hook(event_name, hook_data, plugin)
 
-            # Call on_load hook
             plugin.on_load()
             plugin.enabled = True
 
             self._plugins[plugin_name] = plugin
             logger.info(f"Loaded plugin '{plugin_name}' v{plugin.version}")
 
-            # Trigger lifecycle event
             self.trigger(
                 self.EVENT_PLUGIN_LOADED,
                 {"plugin_name": plugin_name, "version": plugin.version},
@@ -229,19 +255,25 @@ class PluginManager:
             raise PluginLoadError(f"Failed to load plugin '{plugin_name}': {e}") from e
 
     def load_all(self) -> List[str]:
-        """
-        Load all registered plugins in dependency order.
+        """Load every registered plugin, respecting dependencies.
+
+        Iterates registered plugins and calls :meth:`load` on each.
+        Individual load failures are logged (not raised) so one broken
+        plugin does not block the rest; the returned list contains only
+        the names that loaded successfully.
 
         Returns:
-            List of loaded plugin names
+            Names of plugins that loaded successfully, in load order.
 
-        Raises:
-            PluginLoadError: If any plugin fails to load
+        Example:
+            >>> mgr = PluginManager()
+            >>> mgr.register(PluginA)
+            >>> mgr.register(PluginB)
+            >>> loaded = mgr.load_all()
         """
-        loaded_plugins = []
-        failed_plugins = []
+        loaded_plugins: List[str] = []
+        failed_plugins: List[str] = []
 
-        # Try to load all plugins, dependencies will be loaded automatically
         for plugin_name in self._plugin_classes.keys():
             if plugin_name not in self._plugins:
                 try:
@@ -260,14 +292,16 @@ class PluginManager:
         return loaded_plugins
 
     def unload(self, plugin_name: str) -> None:
-        """
-        Unload a specific plugin.
+        """Unload a single plugin and detach its hooks.
+
+        Calls :meth:`PluginBase.on_unload` before removing hooks from
+        the registry. Triggers ``EVENT_PLUGIN_UNLOADED``.
 
         Args:
-            plugin_name: Name of the plugin to unload
+            plugin_name: Name of a currently-loaded plugin.
 
         Raises:
-            PluginNotFoundError: If plugin is not loaded
+            PluginNotFoundError: If the plugin is not currently loaded.
         """
         if plugin_name not in self._plugins:
             raise PluginNotFoundError(f"Plugin '{plugin_name}' not loaded")
@@ -275,11 +309,9 @@ class PluginManager:
         plugin = self._plugins[plugin_name]
 
         try:
-            # Call on_unload hook
             plugin.on_unload()
             plugin.enabled = False
 
-            # Remove all hooks from this plugin
             for event_name in self._registry.get_all_events():
                 hooks = self._registry.get_hooks(event_name)
                 for hook_info in hooks:
@@ -289,7 +321,6 @@ class PluginManager:
             del self._plugins[plugin_name]
             logger.info(f"Unloaded plugin '{plugin_name}'")
 
-            # Trigger lifecycle event
             self.trigger(self.EVENT_PLUGIN_UNLOADED, {"plugin_name": plugin_name})
 
         except Exception as e:
@@ -297,7 +328,11 @@ class PluginManager:
             raise
 
     def unload_all(self) -> None:
-        """Unload all loaded plugins."""
+        """Unload every currently-loaded plugin.
+
+        Errors from individual unloads are logged and do not halt the
+        sweep; the manager's loaded-state flag is cleared on completion.
+        """
         plugin_names = list(self._plugins.keys())
         for plugin_name in plugin_names:
             try:
@@ -309,28 +344,32 @@ class PluginManager:
         logger.info("Unloaded all plugins")
 
     def reload(self, plugin_name: str) -> PluginBase:
-        """
-        Hot reload a plugin (unload and load again).
+        """Hot-reload a plugin, picking up source changes on disk.
+
+        Unloads the plugin (if loaded), reloads its defining module via
+        :func:`importlib.reload`, refreshes the stored class reference
+        so the new definition is used, then calls :meth:`load`. Useful
+        during development for editing a plugin without restarting the
+        host process.
 
         Args:
-            plugin_name: Name of the plugin to reload
+            plugin_name: Name of a registered plugin.
 
         Returns:
-            Reloaded plugin instance
+            The freshly-loaded plugin instance.
 
         Raises:
-            PluginNotFoundError: If plugin is not found
+            PluginNotFoundError: If the plugin is not registered.
+            PluginLoadError: If the post-reload load fails.
         """
         if plugin_name not in self._plugin_classes:
             raise PluginNotFoundError(f"Plugin '{plugin_name}' not registered")
 
         logger.info(f"Reloading plugin '{plugin_name}'")
 
-        # Unload if currently loaded
         if plugin_name in self._plugins:
             self.unload(plugin_name)
 
-        # Reload the plugin module if it's a module-based plugin
         plugin_class = self._plugin_classes[plugin_name]
         if hasattr(plugin_class, "__module__"):
             module_name = plugin_class.__module__
@@ -350,7 +389,6 @@ class PluginManager:
                         self._plugin_classes[plugin_name] = obj
                         break
 
-        # Load the plugin
         return self.load(plugin_name)
 
     def discover_plugins(
@@ -359,19 +397,32 @@ class PluginManager:
         pattern: str = "*_plugin.py",
         recursive: bool = False,
     ) -> List[str]:
-        """
-        Discover and register plugins from a directory.
+        """Auto-register every plugin class found in a directory.
+
+        Walks ``directory`` (optionally recursively), imports each file
+        matching ``pattern`` by file path, and registers every
+        :class:`PluginBase` subclass defined directly in that module.
+        Errors from individual files are logged and skipped so one
+        broken plugin does not halt discovery.
 
         Args:
-            directory: Directory path to search for plugins
-            pattern: File pattern to match (supports glob patterns)
-            recursive: Whether to search recursively
+            directory: Directory to search. Expanded and resolved to an
+                absolute path.
+            pattern: Glob pattern for plugin files. Defaults to
+                ``"*_plugin.py"`` — convention, not enforcement.
+            recursive: If True, descend into subdirectories.
 
         Returns:
-            List of discovered plugin names
+            Names of plugins successfully registered during this call.
 
         Raises:
-            PluginDiscoveryError: If discovery fails
+            PluginDiscoveryError: If the directory does not exist, is
+                not a directory, or the traversal itself errors.
+
+        Example:
+            >>> mgr = PluginManager()
+            >>> mgr.discover_plugins("./plugins", recursive=True)
+            ['welcome', 'logger']
         """
         directory = Path(directory).expanduser().resolve()
 
@@ -380,10 +431,9 @@ class PluginManager:
 
         logger.info(f"Discovering plugins in '{directory}' (pattern: {pattern})")
 
-        discovered = []
+        discovered: List[str] = []
 
         try:
-            # Find matching files
             if recursive:
                 plugin_files = directory.rglob(pattern)
             else:
@@ -394,7 +444,6 @@ class PluginManager:
                     continue
 
                 try:
-                    # Load the module
                     module_name = plugin_file.stem
                     spec = importlib.util.spec_from_file_location(module_name, plugin_file)
                     if spec and spec.loader:
@@ -402,7 +451,6 @@ class PluginManager:
                         sys.modules[module_name] = module
                         spec.loader.exec_module(module)
 
-                        # Find PluginBase subclasses in the module
                         for name, obj in inspect.getmembers(module, inspect.isclass):
                             if (
                                 issubclass(obj, PluginBase)
@@ -435,15 +483,20 @@ class PluginManager:
         priority: int = 50,
         timeout: Optional[float] = None,
     ) -> None:
-        """
-        Register a hook for an event.
+        """Register a callback for an event on the underlying registry.
+
+        Usually called indirectly via :meth:`PluginBase.register_hook`
+        or the :func:`nitro_dispatch.hook` decorator. Call this directly
+        to attach hooks that don't belong to a plugin (``plugin=None``).
 
         Args:
-            event_name: Name of the event
-            callback: Function to call when event is triggered
-            plugin: Plugin instance (optional)
-            priority: Execution priority (higher = earlier)
-            timeout: Maximum execution time in seconds
+            event_name: Event name to subscribe to. Supports wildcards
+                like ``"user.*"`` or ``"db.before_*"``.
+            callback: Callable invoked when the event fires.
+            plugin: Owning plugin instance, or ``None`` for anonymous
+                hooks. Disabled plugins have their hooks skipped.
+            priority: Execution order — higher runs first.
+            timeout: Maximum execution time in seconds, or ``None``.
         """
         self._registry.register(event_name, callback, plugin, priority, timeout)
 
@@ -453,102 +506,122 @@ class PluginManager:
         callback: Callable,
         plugin: Optional[PluginBase] = None,
     ) -> None:
-        """
-        Unregister a hook for an event.
+        """Detach a previously registered hook from the registry.
 
         Args:
-            event_name: Name of the event
-            callback: Function to unregister
-            plugin: Plugin instance (optional)
+            event_name: Event name the callback was registered under.
+            callback: The exact callable previously passed to
+                :meth:`register_hook`.
+            plugin: The same owning plugin (or ``None``) used at
+                registration; the pair must match exactly.
         """
         self._registry.unregister(event_name, callback, plugin)
 
     def trigger(self, event_name: str, data: Any = None) -> Any:
-        """
-        Trigger an event and execute all registered hooks synchronously.
+        """Fire an event and run matching hooks synchronously.
+
+        Async hooks are skipped with a warning — use
+        :meth:`trigger_async` when any listener is ``async def``. Each
+        hook that returns a non-``None`` value replaces ``data`` for
+        the next hook in the chain.
 
         Args:
-            event_name: Name of the event to trigger
-            data: Data to pass to hooks
+            event_name: Event name to fire. Matched literally plus by
+                any wildcard patterns registered against it.
+            data: Payload threaded through the hook chain.
 
         Returns:
-            Modified data after passing through all hooks
+            The payload after the last hook returned.
+
+        Raises:
+            HookError: If the error strategy is ``fail_fast`` and a
+                hook raises.
+
+        Example:
+            >>> mgr.trigger("user.login", {"user": "alice"})
+            {'user': 'alice', 'greeted': True}
         """
         return self._registry.trigger(event_name, data)
 
     async def trigger_async(self, event_name: str, data: Any = None) -> Any:
-        """
-        Trigger an event and execute all registered hooks asynchronously.
+        """Fire an event and run matching hooks asynchronously.
+
+        Handles both sync and async hooks. Sync hooks are dispatched to
+        a thread-pool executor so they don't block the event loop; this
+        means sync hooks must be thread-safe when invoked this way.
 
         Args:
-            event_name: Name of the event to trigger
-            data: Data to pass to hooks
+            event_name: Event name to fire.
+            data: Payload threaded through the hook chain.
 
         Returns:
-            Modified data after passing through all hooks
+            The payload after the last hook returned.
+
+        Raises:
+            HookError: If the error strategy is ``fail_fast`` and a
+                hook raises.
+
+        Example:
+            >>> await mgr.trigger_async("fetch_data", {"id": 42})
         """
         return await self._registry.trigger_async(event_name, data)
 
     def get_plugin(self, plugin_name: str) -> Optional[PluginBase]:
-        """
-        Get a loaded plugin by name.
+        """Return a loaded plugin by name, or ``None`` if not loaded.
 
         Args:
-            plugin_name: Name of the plugin
+            plugin_name: Name of the plugin to retrieve.
 
         Returns:
-            Plugin instance or None if not loaded
+            The plugin instance, or ``None`` if no plugin with that
+            name is currently loaded.
         """
         return self._plugins.get(plugin_name)
 
     def get_all_plugins(self) -> Dict[str, PluginBase]:
-        """
-        Get all loaded plugins.
+        """Return a shallow copy of the loaded-plugins map.
 
         Returns:
-            Dictionary of plugin name to plugin instance
+            A new dict mapping plugin name to plugin instance. Mutating
+            the returned dict does not affect the manager's state.
         """
         return self._plugins.copy()
 
     def get_registered_plugins(self) -> List[str]:
-        """
-        Get names of all registered plugin classes.
+        """Return names of every registered plugin class.
 
         Returns:
-            List of plugin names
+            Plugin names, including those not yet loaded.
         """
         return list(self._plugin_classes.keys())
 
     def get_loaded_plugins(self) -> List[str]:
-        """
-        Get names of all loaded plugins.
+        """Return names of every currently-loaded plugin.
 
         Returns:
-            List of plugin names
+            Plugin names for loaded instances only.
         """
         return list(self._plugins.keys())
 
     def is_loaded(self, plugin_name: str) -> bool:
-        """
-        Check if a plugin is loaded.
+        """Report whether a plugin is currently loaded.
 
         Args:
-            plugin_name: Name of the plugin
+            plugin_name: Name of the plugin to check.
 
         Returns:
-            True if plugin is loaded, False otherwise
+            True if a live instance exists; False otherwise.
         """
         return plugin_name in self._plugins
 
     def enable_plugin(self, plugin_name: str) -> None:
-        """
-        Enable a loaded plugin.
+        """Enable a loaded plugin so its hooks execute again.
 
         Args:
-            plugin_name: Name of the plugin
+            plugin_name: Name of a loaded plugin.
 
         Raises:
-            PluginNotFoundError: If plugin is not loaded
+            PluginNotFoundError: If the plugin is not loaded.
         """
         if plugin_name not in self._plugins:
             raise PluginNotFoundError(f"Plugin '{plugin_name}' not loaded")
@@ -557,14 +630,17 @@ class PluginManager:
         logger.info(f"Enabled plugin '{plugin_name}'")
 
     def disable_plugin(self, plugin_name: str) -> None:
-        """
-        Disable a loaded plugin (keeps it loaded but hooks won't execute).
+        """Disable a loaded plugin without unloading it.
+
+        The plugin instance stays loaded, its hooks stay registered,
+        but the registry skips them on dispatch. Re-enable with
+        :meth:`enable_plugin`.
 
         Args:
-            plugin_name: Name of the plugin
+            plugin_name: Name of a loaded plugin.
 
         Raises:
-            PluginNotFoundError: If plugin is not loaded
+            PluginNotFoundError: If the plugin is not loaded.
         """
         if plugin_name not in self._plugins:
             raise PluginNotFoundError(f"Plugin '{plugin_name}' not loaded")
@@ -573,43 +649,55 @@ class PluginManager:
         logger.info(f"Disabled plugin '{plugin_name}'")
 
     def get_plugin_config(self, plugin_name: str, key: str, default: Any = None) -> Any:
-        """
-        Get configuration value for a plugin.
+        """Read a config value for a specific plugin.
 
         Args:
-            plugin_name: Name of the plugin
-            key: Configuration key
-            default: Default value if not found
+            plugin_name: Plugin namespace (top-level config key).
+            key: Key within that plugin's config dict.
+            default: Value to return when either the plugin or the key
+                is missing.
 
         Returns:
-            Configuration value or default
+            The configured value, or ``default`` if unset.
         """
         plugin_config = self._config.get(plugin_name, {})
         return plugin_config.get(key, default)
 
     def set_error_strategy(self, strategy: str) -> None:
-        """
-        Set the error handling strategy for hooks.
+        """Choose how hook exceptions are handled during dispatch.
+
+        Strategies:
+            - ``"log_and_continue"`` (default): log the error and run
+              the next hook.
+            - ``"fail_fast"``: raise :class:`HookError` and abort the
+              chain.
+            - ``"collect_all"``: run every hook, then log a summary.
 
         Args:
-            strategy: One of 'log_and_continue', 'fail_fast', 'collect_all'
+            strategy: One of the values above.
+
+        Raises:
+            ValueError: If ``strategy`` is not one of the listed names.
         """
         self._registry.set_error_strategy(strategy)
 
     def enable_hook_tracing(self, enabled: bool = True) -> None:
-        """
-        Enable or disable hook execution tracing for debugging.
+        """Toggle per-hook timing logs for debugging.
+
+        When enabled, every dispatch logs the elapsed time of each
+        hook at DEBUG level. Combine with ``log_level="DEBUG"`` on
+        the manager to actually see the output.
 
         Args:
-            enabled: Whether to enable tracing
+            enabled: True to turn tracing on, False to turn it off.
         """
         self._registry.enable_hook_tracing(enabled)
 
     def get_events(self) -> List[str]:
-        """
-        Get all registered event names.
+        """Return every event name with at least one registered hook.
 
         Returns:
-            List of event names
+            Event names — includes wildcard patterns (e.g. ``"user.*"``)
+            as they were registered.
         """
         return self._registry.get_all_events()
