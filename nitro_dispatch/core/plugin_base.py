@@ -1,21 +1,39 @@
-"""
-Base class for all Nitro plugins.
-"""
+"""Base class every Nitro Dispatch plugin must inherit from."""
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 
 class PluginBase:
-    """
-    Base class that all plugins must inherit from.
+    """Base class all plugins must inherit from.
+
+    Subclass this and set class-level metadata (``name``, ``version``, ...).
+    Decorate methods with :func:`nitro_dispatch.hook` to register them as
+    event handlers, or override :meth:`on_load` and register them manually.
+    The :class:`PluginManager` instantiates the subclass, collects decorated
+    hooks, resolves dependencies, and calls :meth:`on_load`.
 
     Attributes:
-        name: Unique identifier for the plugin
-        version: Plugin version string
-        description: Human-readable description
-        author: Plugin author
-        dependencies: List of plugin names this plugin depends on
-        enabled: Whether the plugin is currently enabled
+        name: Unique plugin identifier. Defaults to the class name if left
+            empty. Used by the manager to look the plugin up.
+        version: Semantic version string for the plugin.
+        description: Short human-readable summary of what the plugin does.
+        author: Plugin author or team name.
+        dependencies: Names of other plugins that must load first. The
+            manager loads them recursively before this plugin.
+        enabled: Whether hooks from this plugin currently execute. Toggled
+            by :meth:`PluginManager.enable_plugin` /
+            :meth:`PluginManager.disable_plugin`.
+
+    Example:
+        >>> from nitro_dispatch import PluginBase, hook
+        >>> class WelcomePlugin(PluginBase):
+        ...     name = "welcome"
+        ...     version = "1.0.0"
+        ...
+        ...     @hook("user.login", priority=100)
+        ...     def greet(self, data):
+        ...         data["greeting"] = f"Hi, {data['user']}!"
+        ...         return data
     """
 
     name: str = ""
@@ -24,11 +42,11 @@ class PluginBase:
     author: str = ""
     dependencies: List[str] = []
 
-    def __init__(self):
-        """Initialize the plugin."""
+    def __init__(self) -> None:
+        """Initialize the plugin instance and collect decorated hooks."""
         self.enabled: bool = False
         self._manager: Optional[Any] = None
-        self._hooks: Dict[str, List[callable]] = {}
+        self._hooks: Dict[str, List[Any]] = {}
 
         # Shadow the class-level mutable list with a per-instance copy so
         # subclasses that mutate self.dependencies don't leak into siblings.
@@ -43,52 +61,85 @@ class PluginBase:
         if "name" not in self.__class__.__dict__ and not self.name:
             self.name = self.__class__.__name__
 
-        # Auto-collect decorated hooks
         self._collect_decorated_hooks()
 
     def on_load(self) -> None:
-        """
-        Called when the plugin is loaded.
-        Override this method to register hooks and initialize resources.
+        """Run once when the plugin is loaded by the manager.
+
+        Override to acquire resources, open connections, or register hooks
+        manually via :meth:`register_hook`. The default implementation is a
+        no-op, so subclasses that only use the ``@hook`` decorator do not
+        need to override this.
+
+        Example:
+            >>> class LoggerPlugin(PluginBase):
+            ...     name = "logger"
+            ...
+            ...     def on_load(self):
+            ...         self.register_hook("before_save", self._log, priority=10)
         """
         pass
 
     def on_unload(self) -> None:
-        """
-        Called when the plugin is unloaded.
-        Override this method to cleanup resources.
+        """Run once when the plugin is unloaded by the manager.
+
+        Override to release resources acquired in :meth:`on_load`. Called
+        from :meth:`PluginManager.unload` and :meth:`PluginManager.reload`
+        before the plugin's hooks are detached from the registry.
         """
         pass
 
     def on_error(self, error: Exception) -> None:
-        """
-        Called when an error occurs during hook execution.
+        """Handle exceptions raised by this plugin's hooks.
+
+        Called by the registry whenever one of this plugin's hooks raises
+        (including :class:`HookTimeoutError`). Does not supersede the
+        configured error strategy — the registry still logs, re-raises, or
+        collects the error as configured.
 
         Args:
-            error: The exception that was raised
+            error: The exception raised by the failing hook.
         """
         pass
 
     def register_hook(
         self,
         event_name: str,
-        callback: callable,
+        callback: Callable,
         priority: int = 50,
         timeout: Optional[float] = None,
     ) -> None:
-        """
-        Register a callback for a specific event.
+        """Register a callback for an event.
+
+        Prefer the :func:`nitro_dispatch.hook` decorator for static hooks.
+        Use this for runtime registration, typically from :meth:`on_load`.
+        If the plugin is not yet attached to a manager, the hook is stored
+        and registered when the plugin loads.
 
         Args:
-            event_name: Name of the event to listen for
-            callback: Function to call when event is triggered
-            priority: Execution priority (higher = earlier). Default: 50
-            timeout: Maximum execution time in seconds. None = no timeout
+            event_name: Event name to subscribe to. Supports wildcard
+                patterns such as ``"user.*"`` or ``"db.before_*"``.
+            callback: Callable invoked when the event fires. Receives the
+                event data and may return modified data.
+            priority: Execution order relative to other hooks for the same
+                event — higher runs first. Ties break by registration
+                order.
+            timeout: Maximum execution time in seconds, or ``None`` for no
+                limit. Exceeding raises :class:`HookTimeoutError`.
+
+        Example:
+            >>> class MyPlugin(PluginBase):
+            ...     name = "my_plugin"
+            ...
+            ...     def on_load(self):
+            ...         self.register_hook("user.login", self.audit, priority=90)
+            ...
+            ...     def audit(self, data):
+            ...         return data
         """
         if self._manager:
             self._manager.register_hook(event_name, callback, self, priority, timeout)
         else:
-            # Store for later registration with metadata
             if event_name not in self._hooks:
                 self._hooks[event_name] = []
             self._hooks[event_name].append(
@@ -99,54 +150,61 @@ class PluginBase:
                 }
             )
 
-    def unregister_hook(self, event_name: str, callback: callable) -> None:
-        """
-        Unregister a callback for a specific event.
+    def unregister_hook(self, event_name: str, callback: Callable) -> None:
+        """Detach a previously registered callback from an event.
+
+        A no-op if the plugin is not attached to a manager, or if the
+        callback is not registered for ``event_name``.
 
         Args:
-            event_name: Name of the event
-            callback: Function to unregister
+            event_name: Event name the callback was registered under.
+            callback: The exact callable passed to :meth:`register_hook`.
         """
         if self._manager:
             self._manager.unregister_hook(event_name, callback, self)
 
     def trigger(self, event_name: str, data: Any = None) -> Any:
-        """
-        Trigger an event from within the plugin.
+        """Fire an event through this plugin's manager.
+
+        Convenience wrapper so plugins can emit events without needing a
+        direct reference to the manager. Returns ``data`` unchanged if the
+        plugin is not yet attached to a manager.
 
         Args:
-            event_name: Name of the event to trigger
-            data: Data to pass to event handlers
+            event_name: Name of the event to trigger.
+            data: Payload passed to each matching hook.
 
         Returns:
-            Modified data after passing through all hooks
+            The payload after every hook in the chain has run.
         """
         if self._manager:
             return self._manager.trigger(event_name, data)
         return data
 
     def get_config(self, key: str, default: Any = None) -> Any:
-        """
-        Get a configuration value for this plugin.
+        """Read a config value scoped to this plugin.
+
+        Looks up ``manager.config[self.name][key]``. Returns ``default`` if
+        the plugin is not attached to a manager or the key is absent.
 
         Args:
-            key: Configuration key
-            default: Default value if key not found
+            key: Configuration key within this plugin's namespace.
+            default: Value to return when the key is not configured.
 
         Returns:
-            Configuration value or default
+            The configured value, or ``default`` if unset.
         """
         if self._manager:
             return self._manager.get_plugin_config(self.name, key, default)
         return default
 
     def _collect_decorated_hooks(self) -> None:
-        """
-        Collect all methods decorated with @hook and store them.
-        They will be registered when the plugin is loaded.
+        """Gather @hook-decorated methods into ``self._hooks``.
+
+        Called from ``__init__`` so the manager can register them at load
+        time. Skips private/magic attributes to avoid unnecessary access.
         """
         for attr_name in dir(self):
-            # Skip private/magic methods
             if attr_name.startswith("_"):
                 continue
 
@@ -155,7 +213,6 @@ class PluginBase:
             except AttributeError:
                 continue
 
-            # Check if it's a hook-decorated method
             if callable(attr) and hasattr(attr, "_is_hook") and attr._is_hook:
                 event_name = attr._event_name
                 priority = getattr(attr, "_priority", 50)
@@ -172,5 +229,5 @@ class PluginBase:
                 )
 
     def __repr__(self) -> str:
-        """String representation of the plugin."""
+        """Return a debug-friendly representation including name and version."""
         return f"<{self.__class__.__name__} name='{self.name}' " f"version='{self.version}'>"

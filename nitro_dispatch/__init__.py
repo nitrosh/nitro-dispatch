@@ -34,7 +34,7 @@ Example:
     result = manager.trigger('before_save', {'key': 'value'})
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.2"
 __author__ = "Sean Nieuwoudt"
 __license__ = "MIT"
 

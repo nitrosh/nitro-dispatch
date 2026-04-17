@@ -1,6 +1,4 @@
-"""
-Hook registry for managing event subscriptions and triggers.
-"""
+"""Hook registry: event subscriptions and sync/async dispatch."""
 
 import asyncio
 import concurrent.futures
@@ -14,23 +12,31 @@ logger = logging.getLogger(__name__)
 
 
 class HookRegistry:
-    """
-    Manages hook registration and event triggering.
+    """Event bus storing hooks and dispatching them to listeners.
 
-    This class maintains a registry of event hooks and provides both
-    synchronous and asynchronous execution with data filtering capabilities.
+    Hooks are kept per event name and sorted by priority (higher first,
+    registration order for ties). On :meth:`trigger` / :meth:`trigger_async`
+    the registry gathers every hook whose registered name matches the fired
+    event — either literally or via a wildcard pattern like ``"user.*"`` —
+    and invokes them in priority order, threading the return value of each
+    hook into the next as its input.
+
+    The manager owns an instance of this class; most application code does
+    not interact with it directly. Use it standalone when you want the hook
+    mechanism without plugins.
 
     Features:
-    - Priority-based execution
-    - Timeout protection
-    - Async/await support
-    - Event namespacing with wildcards
-    - Stop propagation support
-    - Enable/disable plugin filtering
+        - Priority-based execution with deterministic ordering.
+        - Per-hook timeout (thread-based for sync, ``asyncio.wait_for``
+          for async).
+        - Wildcard event matching (``"user.*"``, ``"db.before_*"``).
+        - :class:`StopPropagation` to halt the chain from a hook.
+        - Plugin-level enable/disable: hooks from disabled plugins are
+          skipped without unregistering.
     """
 
-    def __init__(self):
-        """Initialize the hook registry."""
+    def __init__(self) -> None:
+        """Initialize an empty registry with the default error strategy."""
         self._hooks: Dict[str, List[Dict[str, Any]]] = {}
         self._error_strategy: str = "log_and_continue"
         self._hook_tracing: bool = False
@@ -43,15 +49,29 @@ class HookRegistry:
         priority: int = 50,
         timeout: Optional[float] = None,
     ) -> None:
-        """
-        Register a callback for an event.
+        """Register a callback to run when an event fires.
+
+        Whether ``callback`` is treated as async is auto-detected via
+        :func:`asyncio.iscoroutinefunction`. Async callbacks are skipped
+        in :meth:`trigger` with a warning; use :meth:`trigger_async`.
 
         Args:
-            event_name: Name of the event (supports wildcards: 'user.*')
-            callback: Function to call when event is triggered
-            plugin: Plugin instance that owns this hook (optional)
-            priority: Execution priority (higher = earlier). Default: 50
-            timeout: Maximum execution time in seconds
+            event_name: Event name to subscribe to. May be a literal like
+                ``"before_save"`` or a wildcard pattern like ``"user.*"``
+                — wildcard patterns match multiple literal events at
+                dispatch time.
+            callback: Function invoked when the event fires. Receives
+                the event's data and may return modified data.
+            plugin: Owning plugin instance, used for attribution and to
+                honor ``enabled``/``disabled`` state. ``None`` for
+                anonymous hooks.
+            priority: Higher values run earlier. Default 50.
+            timeout: Per-hook execution limit in seconds. Exceeding
+                raises :class:`HookTimeoutError` inside dispatch.
+
+        Example:
+            >>> reg = HookRegistry()
+            >>> reg.register("user.*", lambda d: d, priority=100)
         """
         if event_name not in self._hooks:
             self._hooks[event_name] = []
@@ -77,16 +97,19 @@ class HookRegistry:
         )
 
     def unregister(self, event_name: str, callback: Callable, plugin: Optional[Any] = None) -> bool:
-        """
-        Unregister a callback for an event.
+        """Remove a previously registered callback from an event.
+
+        Match is on the exact ``(callback, plugin)`` pair. If the same
+        callback was registered for multiple events, each must be
+        unregistered separately.
 
         Args:
-            event_name: Name of the event
-            callback: Function to unregister
-            plugin: Plugin instance (optional)
+            event_name: Event name the callback was registered under.
+            callback: The exact callable passed to :meth:`register`.
+            plugin: The same owning plugin used at registration.
 
         Returns:
-            True if hook was found and removed, False otherwise
+            True if a hook was found and removed; False otherwise.
         """
         if event_name not in self._hooks:
             return False
@@ -204,22 +227,32 @@ class HookRegistry:
             raise HookTimeoutError(f"Async hook execution exceeded timeout of {timeout}s")
 
     def trigger(self, event_name: str, data: Any = None) -> Any:
-        """
-        Trigger an event and execute all registered hooks synchronously.
+        """Fire an event and run matching hooks synchronously.
 
-        Hooks are executed in priority order (highest first).
-        Each hook can modify the data, which is passed to the next hook.
+        Hooks run in priority order (highest first). Each hook's
+        non-``None`` return value becomes the ``data`` input of the next
+        hook. A hook raising :class:`StopPropagation` halts the chain
+        and the current ``data`` is returned immediately. Async hooks
+        are skipped with a warning — use :meth:`trigger_async` for
+        those.
 
         Args:
-            event_name: Name of the event to trigger
-            data: Data to pass to hooks (can be modified by hooks)
+            event_name: Event name to fire. Literal plus wildcard
+                matches are dispatched.
+            data: Payload threaded through the chain.
 
         Returns:
-            Modified data after passing through all hooks
+            The payload after the last hook returned.
 
         Raises:
-            HookError: If error_strategy is 'fail_fast' and a hook fails
-            StopPropagation: If a hook raises this to stop the chain
+            HookError: If the error strategy is ``"fail_fast"`` and a
+                hook raises.
+
+        Example:
+            >>> reg = HookRegistry()
+            >>> reg.register("sum", lambda d: d + 1)
+            >>> reg.trigger("sum", 41)
+            42
         """
         hooks = self._get_matching_hooks(event_name)
 
@@ -331,22 +364,32 @@ class HookRegistry:
         return result
 
     async def trigger_async(self, event_name: str, data: Any = None) -> Any:
-        """
-        Trigger an event and execute all registered hooks asynchronously.
+        """Fire an event asynchronously, running matching hooks.
 
-        Both sync and async hooks are supported. Sync hooks are wrapped
-        to run in the async context.
+        Async hooks run natively via ``asyncio.wait_for``. Sync hooks
+        are dispatched to the default executor so they do not block
+        the event loop — which means sync hooks must be thread-safe
+        when invoked through this method. Ordering, stop-propagation,
+        and error-strategy semantics are identical to :meth:`trigger`.
 
         Args:
-            event_name: Name of the event to trigger
-            data: Data to pass to hooks
+            event_name: Event name to fire.
+            data: Payload threaded through the chain.
 
         Returns:
-            Modified data after passing through all hooks
+            The payload after the last hook returned.
 
         Raises:
-            HookError: If error_strategy is 'fail_fast' and a hook fails
-            StopPropagation: If a hook raises this to stop the chain
+            HookError: If the error strategy is ``"fail_fast"`` and a
+                hook raises.
+
+        Example:
+            >>> import asyncio
+            >>> reg = HookRegistry()
+            >>> async def bump(d): return d + 1
+            >>> reg.register("sum", bump)
+            >>> asyncio.run(reg.trigger_async("sum", 41))
+            42
         """
         hooks = self._get_matching_hooks(event_name)
 
@@ -464,48 +507,67 @@ class HookRegistry:
         return result
 
     def get_hooks(self, event_name: str) -> List[Dict[str, Any]]:
-        """
-        Get all hooks registered for an event (including wildcards).
+        """Return every hook that would run for an event, in priority order.
+
+        Includes hooks registered against wildcard patterns that match
+        ``event_name``, not just literal matches.
 
         Args:
-            event_name: Name of the event
+            event_name: Event name to resolve.
 
         Returns:
-            List of hook information dictionaries
+            List of hook info dicts with keys ``callback``, ``plugin``,
+            ``plugin_name``, ``priority``, ``timeout``, ``is_async``.
         """
         return self._get_matching_hooks(event_name)
 
     def get_all_events(self) -> List[str]:
-        """
-        Get all registered event names.
+        """Return every registered event name.
 
         Returns:
-            List of event names
+            The literal strings used at registration — wildcard patterns
+            are returned as-is (e.g. ``"user.*"``).
         """
         return list(self._hooks.keys())
 
     def clear_event(self, event_name: str) -> None:
-        """
-        Clear all hooks for a specific event.
+        """Remove every hook registered under a single event name.
+
+        Only removes hooks registered with the literal ``event_name``;
+        wildcard patterns that happen to match are left intact.
 
         Args:
-            event_name: Name of the event to clear
+            event_name: Event name to clear.
         """
         if event_name in self._hooks:
             del self._hooks[event_name]
             logger.debug(f"Cleared all hooks for event '{event_name}'")
 
     def clear_all(self) -> None:
-        """Clear all registered hooks."""
+        """Remove every registered hook.
+
+        Use between tests or when reconfiguring the registry from
+        scratch.
+        """
         self._hooks.clear()
         logger.debug("Cleared all hooks")
 
     def set_error_strategy(self, strategy: str) -> None:
-        """
-        Set the error handling strategy.
+        """Choose how hook exceptions are handled during dispatch.
+
+        Strategies:
+            - ``"log_and_continue"`` (default): log the error and run
+              the next hook.
+            - ``"fail_fast"``: raise :class:`HookError` and abort the
+              chain.
+            - ``"collect_all"``: run every hook, then log a summary of
+              how many failed.
 
         Args:
-            strategy: One of 'log_and_continue', 'fail_fast', 'collect_all'
+            strategy: One of the values above.
+
+        Raises:
+            ValueError: If ``strategy`` is not one of the listed names.
         """
         valid_strategies = ["log_and_continue", "fail_fast", "collect_all"]
         if strategy not in valid_strategies:
@@ -514,13 +576,13 @@ class HookRegistry:
         logger.debug(f"Error strategy set to '{strategy}'")
 
     def enable_hook_tracing(self, enabled: bool = True) -> None:
-        """
-        Enable or disable hook tracing for debugging.
+        """Toggle per-hook timing logs for debugging.
 
-        When enabled, logs detailed information about hook execution times.
+        When on, each dispatch logs the elapsed time of every hook at
+        DEBUG level. Configure the root logger at DEBUG to see output.
 
         Args:
-            enabled: Whether to enable tracing
+            enabled: True to turn tracing on, False to turn it off.
         """
         self._hook_tracing = enabled
         logger.debug(f"Hook tracing {'enabled' if enabled else 'disabled'}")
