@@ -2,6 +2,11 @@
 
 A powerful, framework-agnostic plugin system for Python with advanced features like async/await support, hook priorities, timeouts, event namespacing, and plugin discovery.
 
+[![PyPI](https://img.shields.io/pypi/v/nitro-dispatch?color=green)](https://pypi.org/project/nitro-dispatch/)
+[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/nitro-dispatch)](https://pypi.org/project/nitro-dispatch/)
+[![PyPI - License](https://img.shields.io/pypi/l/nitro-dispatch)](https://pypi.org/project/nitro-dispatch/)
+[![image](https://img.shields.io/github/actions/workflow/status/nitrosh/nitro-dispatch/test.yml?branch=main)](https://github.com/nitrosh/nitro-dispatch/actions?query=branch%3Amain)
+
 ## Requirements
 
 Python `3.9` or higher is required.
@@ -10,6 +15,28 @@ Python `3.9` or higher is required.
 
 ```bash
 pip install nitro-dispatch
+```
+
+## Quick Start
+
+```python
+from nitro_dispatch import PluginManager, PluginBase, hook
+
+class WelcomePlugin(PluginBase):
+    name = "welcome"
+
+    @hook('user.login', priority=100)
+    def greet_user(self, data):
+        print(f"Welcome, {data['username']}!")
+        data['greeted'] = True
+        return data
+
+manager = PluginManager()
+manager.register(WelcomePlugin)
+manager.load_all()
+
+result = manager.trigger('user.login', {'username': 'Alice'})
+# Output: Welcome, Alice!
 ```
 
 ## Features
@@ -35,28 +62,6 @@ pip install nitro-dispatch
 - **Hook Tracing** - Debug with detailed execution timing
 - **Built-in Lifecycle Events** - Hook into plugin lifecycle
 - **Metadata Validation** - Ensure plugin quality
-
-## Quick Start
-
-```python
-from nitro_dispatch import PluginManager, PluginBase, hook
-
-class WelcomePlugin(PluginBase):
-    name = "welcome"
-
-    @hook('user.login', priority=100)
-    def greet_user(self, data):
-        print(f"Welcome, {data['username']}!")
-        data['greeted'] = True
-        return data
-
-manager = PluginManager()
-manager.register(WelcomePlugin)
-manager.load_all()
-
-result = manager.trigger('user.login', {'username': 'Alice'})
-# Output: Welcome, Alice!
-```
 
 ## Core Concepts
 
