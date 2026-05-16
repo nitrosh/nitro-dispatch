@@ -17,7 +17,7 @@ class HookRegistry:
     Hooks are kept per event name and sorted by priority (higher first,
     registration order for ties). On :meth:`trigger` / :meth:`trigger_async`
     the registry gathers every hook whose registered name matches the fired
-    event — either literally or via a wildcard pattern like ``"user.*"`` —
+    event, either literally or via a wildcard pattern like ``"user.*"``,
     and invokes them in priority order, threading the return value of each
     hook into the next as its input.
 
@@ -57,8 +57,8 @@ class HookRegistry:
 
         Args:
             event_name: Event name to subscribe to. May be a literal like
-                ``"before_save"`` or a wildcard pattern like ``"user.*"``
-                — wildcard patterns match multiple literal events at
+                ``"before_save"`` or a wildcard pattern like ``"user.*"``;
+                wildcard patterns match multiple literal events at
                 dispatch time.
             callback: Function invoked when the event fires. Receives
                 the event's data and may return modified data.
@@ -137,8 +137,9 @@ class HookRegistry:
         Returns:
             True if event matches pattern
         """
-        # Convert wildcard pattern to regex
-        regex_pattern = pattern.replace(".", r"\.").replace("*", ".*")
+        # `*` matches a single dot-delimited segment, mirroring glob semantics
+        # rather than regex `.*` (which would cross segment boundaries).
+        regex_pattern = pattern.replace(".", r"\.").replace("*", "[^.]*")
         regex_pattern = f"^{regex_pattern}$"
         return bool(re.match(regex_pattern, event))
 
@@ -190,7 +191,7 @@ class HookRegistry:
 
         # Thread-based timeout: portable (works on Windows and in non-main
         # threads, unlike signal.SIGALRM) and safe to call from executors.
-        # Note: the worker thread cannot be forcibly killed on timeout — this
+        # Note: the worker thread cannot be forcibly killed on timeout. This
         # matches asyncio.wait_for's behavior for async hooks.
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(callback, data)
@@ -233,7 +234,7 @@ class HookRegistry:
         non-``None`` return value becomes the ``data`` input of the next
         hook. A hook raising :class:`StopPropagation` halts the chain
         and the current ``data`` is returned immediately. Async hooks
-        are skipped with a warning — use :meth:`trigger_async` for
+        are skipped with a warning; use :meth:`trigger_async` for
         those.
 
         Args:
@@ -368,7 +369,7 @@ class HookRegistry:
 
         Async hooks run natively via ``asyncio.wait_for``. Sync hooks
         are dispatched to the default executor so they do not block
-        the event loop — which means sync hooks must be thread-safe
+        the event loop, which means sync hooks must be thread-safe
         when invoked through this method. Ordering, stop-propagation,
         and error-strategy semantics are identical to :meth:`trigger`.
 
@@ -428,7 +429,7 @@ class HookRegistry:
                     )
                 else:
                     # Run sync hook in executor to avoid blocking
-                    loop = asyncio.get_event_loop()
+                    loop = asyncio.get_running_loop()
                     new_result = await loop.run_in_executor(
                         None,
                         self._execute_hook_with_timeout,
@@ -525,7 +526,7 @@ class HookRegistry:
         """Return every registered event name.
 
         Returns:
-            The literal strings used at registration — wildcard patterns
+            The literal strings used at registration. Wildcard patterns
             are returned as-is (e.g. ``"user.*"``).
         """
         return list(self._hooks.keys())

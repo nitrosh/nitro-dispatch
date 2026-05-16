@@ -50,7 +50,7 @@ class PluginBase:
 
         # Shadow the class-level mutable list with a per-instance copy so
         # subclasses that mutate self.dependencies don't leak into siblings.
-        # Only shadow when the class value is actually a list — otherwise
+        # Only shadow when the class value is actually a list; otherwise
         # leave the invalid type intact for metadata validation to surface.
         if isinstance(self.__class__.dependencies, list):
             self.dependencies = list(self.__class__.dependencies)
@@ -94,7 +94,7 @@ class PluginBase:
 
         Called by the registry whenever one of this plugin's hooks raises
         (including :class:`HookTimeoutError`). Does not supersede the
-        configured error strategy — the registry still logs, re-raises, or
+        configured error strategy; the registry still logs, re-raises, or
         collects the error as configured.
 
         Args:
@@ -122,7 +122,7 @@ class PluginBase:
             callback: Callable invoked when the event fires. Receives the
                 event data and may return modified data.
             priority: Execution order relative to other hooks for the same
-                event — higher runs first. Ties break by registration
+                event; higher runs first. Ties break by registration
                 order.
             timeout: Maximum execution time in seconds, or ``None`` for no
                 limit. Exceeding raises :class:`HookTimeoutError`.

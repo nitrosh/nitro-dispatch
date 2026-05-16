@@ -198,6 +198,22 @@ def test_wildcard_patterns(registry):
     assert "matched" not in result3
 
 
+def test_wildcard_matches_single_segment_only(registry):
+    """`*` matches one dot-delimited segment, not many."""
+
+    def callback(data):
+        data["matched"] = True
+        return data
+
+    registry.register("user.*", callback)
+
+    result_direct = registry.trigger("user.login", {})
+    assert result_direct["matched"] is True
+
+    result_nested = registry.trigger("user.profile.update", {})
+    assert "matched" not in result_nested
+
+
 def test_stop_propagation(registry):
     """Test stop propagation."""
     called = []

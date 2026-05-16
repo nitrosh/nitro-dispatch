@@ -16,18 +16,18 @@ def hook(
     The decorator attaches metadata to the wrapped method;
     :class:`PluginBase` collects every method marked this way when the
     plugin is instantiated and registers them with the manager on load.
-    Works for both sync and ``async def`` methods — async is detected
+    Works for both sync and ``async def`` methods. Async is detected
     automatically, so ``async_hook`` is only needed in unusual cases.
 
     Args:
         event_name: Event to subscribe to. Supports wildcard patterns
             like ``"user.*"`` or ``"db.before_*"``.
         priority: Execution order relative to other hooks on the same
-            event — higher runs first. Default 50.
+            event; higher runs first. Default 50.
         timeout: Per-call execution limit in seconds, or ``None`` for
             no limit. Exceeding raises :class:`HookTimeoutError`.
         async_hook: Force-mark the method as async. Normally left
-            ``False`` — auto-detection covers the common cases.
+            ``False``; auto-detection covers the common cases.
 
     Returns:
         A decorator that wraps the method with hook metadata and
@@ -53,6 +53,13 @@ def hook(
     """
 
     def decorator(func: Callable) -> Callable:
+        if getattr(func, "_is_hook", False):
+            raise TypeError(
+                f"@hook cannot be stacked on '{getattr(func, '__name__', func)}'. "
+                f"Each method subscribes to a single event. Already bound to "
+                f"'{getattr(func, '_event_name', '<unknown>')}'."
+            )
+
         is_async = async_hook or asyncio.iscoroutinefunction(func)
 
         if is_async:
