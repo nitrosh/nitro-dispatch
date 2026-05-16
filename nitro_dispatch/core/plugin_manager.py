@@ -93,10 +93,10 @@ class PluginManager:
 
         logging.basicConfig(level=getattr(logging, log_level.upper()))
 
-    def register(self, plugin_class: Type[PluginBase], validate: bool = True) -> None:
+    def register(self, plugin_class: Type[PluginBase], validate: bool = True) -> str:
         """Register a plugin class so it can later be loaded.
 
-        Registration stores the class — no instance is kept. The class is
+        Registration stores the class, no instance is kept. The class is
         instantiated once temporarily to read its ``name`` and validate
         metadata. Registering a name that already exists overwrites the
         previous registration and logs a warning.
@@ -109,6 +109,9 @@ class PluginManager:
                 False, skips validation even if the manager was created
                 with ``validate_metadata=True``.
 
+        Returns:
+            The plugin's ``name`` as resolved at registration time.
+
         Raises:
             PluginRegistrationError: If ``plugin_class`` does not inherit
                 from :class:`PluginBase`.
@@ -119,6 +122,7 @@ class PluginManager:
         Example:
             >>> mgr = PluginManager()
             >>> mgr.register(MyPlugin)
+            'my_plugin'
         """
         if not issubclass(plugin_class, PluginBase):
             raise PluginRegistrationError(f"{plugin_class.__name__} must inherit from PluginBase")
@@ -139,6 +143,8 @@ class PluginManager:
             self.EVENT_PLUGIN_REGISTERED,
             {"plugin_name": plugin_name, "version": temp_instance.version},
         )
+
+        return plugin_name
 
     def _validate_plugin_metadata(self, plugin: PluginBase) -> None:
         """Validate ``name``, ``version``, and ``dependencies`` on an instance."""
@@ -380,12 +386,13 @@ class PluginManager:
                 # importlib.reload replaces the module's classes with new
                 # objects. Refresh our stored class reference so the subsequent
                 # load() instantiates the new code, not the pre-reload class.
+                # Read the name from class attrs to avoid running __init__ on
+                # every PluginBase subclass in the module during reload.
                 for _, obj in inspect.getmembers(reloaded_module, inspect.isclass):
-                    if (
-                        issubclass(obj, PluginBase)
-                        and obj is not PluginBase
-                        and obj().name == plugin_name
-                    ):
+                    if not issubclass(obj, PluginBase) or obj is PluginBase:
+                        continue
+                    candidate_name = obj.name if obj.__dict__.get("name") else obj.__name__
+                    if candidate_name == plugin_name:
                         self._plugin_classes[plugin_name] = obj
                         break
 
@@ -409,7 +416,7 @@ class PluginManager:
             directory: Directory to search. Expanded and resolved to an
                 absolute path.
             pattern: Glob pattern for plugin files. Defaults to
-                ``"*_plugin.py"`` — convention, not enforcement.
+                ``"*_plugin.py"`` by convention, not enforcement.
             recursive: If True, descend into subdirectories.
 
         Returns:
@@ -458,8 +465,7 @@ class PluginManager:
                                 and obj.__module__ == module_name
                             ):
 
-                                self.register(obj)
-                                plugin_name = obj().name
+                                plugin_name = self.register(obj)
                                 discovered.append(plugin_name)
                                 logger.debug(
                                     f"Discovered plugin '{plugin_name}' from {plugin_file}"
@@ -495,7 +501,7 @@ class PluginManager:
             callback: Callable invoked when the event fires.
             plugin: Owning plugin instance, or ``None`` for anonymous
                 hooks. Disabled plugins have their hooks skipped.
-            priority: Execution order — higher runs first.
+            priority: Execution order; higher runs first.
             timeout: Maximum execution time in seconds, or ``None``.
         """
         self._registry.register(event_name, callback, plugin, priority, timeout)
@@ -520,7 +526,7 @@ class PluginManager:
     def trigger(self, event_name: str, data: Any = None) -> Any:
         """Fire an event and run matching hooks synchronously.
 
-        Async hooks are skipped with a warning — use
+        Async hooks are skipped with a warning; use
         :meth:`trigger_async` when any listener is ``async def``. Each
         hook that returns a non-``None`` value replaces ``data`` for
         the next hook in the chain.
@@ -697,7 +703,7 @@ class PluginManager:
         """Return every event name with at least one registered hook.
 
         Returns:
-            Event names — includes wildcard patterns (e.g. ``"user.*"``)
+            Event names. Includes wildcard patterns (e.g. ``"user.*"``)
             as they were registered.
         """
         return self._registry.get_all_events()

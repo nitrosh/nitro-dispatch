@@ -3,6 +3,7 @@ Tests for Nitro Dispatch decorators.
 """
 
 import asyncio
+import pytest
 from nitro_dispatch.utils.decorators import hook
 from nitro_dispatch import PluginBase
 
@@ -146,3 +147,17 @@ def test_auto_collect_hooks():
     # Hooks should be stored in _hooks dict
     assert "event1" in plugin._hooks
     assert "event2" in plugin._hooks
+
+
+def test_hook_decorator_rejects_stacking():
+    """Stacking @hook on the same method raises TypeError."""
+
+    with pytest.raises(TypeError, match="cannot be stacked"):
+
+        class _Bad(PluginBase):
+            name = "bad"
+
+            @hook("event.a")
+            @hook("event.b")
+            def handler(self, data):
+                return data
