@@ -202,27 +202,41 @@ class PluginBase:
         """Gather @hook-decorated methods into ``self._hooks``.
 
         Called from ``__init__`` so the manager can register them at load
-        time. Skips private/magic attributes to avoid unnecessary access.
+        time. Walks ``type(self).__mro__`` and inspects raw class-dict
+        entries instead of calling ``getattr(self, ...)``, so subclasses
+        that define ``@property`` descriptors do NOT have those
+        descriptors invoked during plugin construction (which happens
+        during discovery, registration, load, and reload).
         """
-        for attr_name in dir(self):
-            if attr_name.startswith("_"):
+        seen: set = set()
+        for klass in type(self).__mro__:
+            if klass is object:
                 continue
+            for attr_name, raw in klass.__dict__.items():
+                if attr_name.startswith("_") or attr_name in seen:
+                    continue
+                # The @hook decorator wraps the function and sets
+                # ``_is_hook`` on the *function object* itself. Reading
+                # it from the class dict avoids descriptor invocation
+                # (properties, classmethods with side effects, etc.).
+                if not (callable(raw) and getattr(raw, "_is_hook", False)):
+                    continue
+                seen.add(attr_name)
 
-            try:
-                attr = getattr(self, attr_name)
-            except AttributeError:
-                continue
+                # Bind to ``self`` so the registered callback carries
+                # the instance — matches the previous behavior obtained
+                # via ``getattr(self, attr_name)``.
+                bound = getattr(self, attr_name)
 
-            if callable(attr) and hasattr(attr, "_is_hook") and attr._is_hook:
-                event_name = attr._event_name
-                priority = getattr(attr, "_priority", 50)
-                timeout = getattr(attr, "_timeout", None)
+                event_name = raw._event_name
+                priority = getattr(raw, "_priority", 50)
+                timeout = getattr(raw, "_timeout", None)
 
                 if event_name not in self._hooks:
                     self._hooks[event_name] = []
                 self._hooks[event_name].append(
                     {
-                        "callback": attr,
+                        "callback": bound,
                         "priority": priority,
                         "timeout": timeout,
                     }

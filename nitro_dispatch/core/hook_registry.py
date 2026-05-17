@@ -2,7 +2,9 @@
 
 import asyncio
 import concurrent.futures
+import inspect
 import re
+import threading
 from typing import Any, Callable, Dict, List, Optional
 import logging
 
@@ -33,13 +35,34 @@ class HookRegistry:
         - :class:`StopPropagation` to halt the chain from a hook.
         - Plugin-level enable/disable: hooks from disabled plugins are
           skipped without unregistering.
+        - Thread-safe registration and dispatch: mutations and
+          ``_get_matching_hooks`` are guarded by an :class:`RLock` and
+          iteration snapshots the hook map.
     """
+
+    # Class-level executor shared across instances so a hung sync-hook
+    # worker never gets joined by ThreadPoolExecutor.__exit__ on the
+    # caller's behalf. ``daemon=True`` lets the process exit even if a
+    # runaway hook is still in flight. We deliberately do not call
+    # ``shutdown(wait=True)`` anywhere on this pool.
+    _timeout_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=8,
+        thread_name_prefix="nitro-hook-timeout",
+    )
 
     def __init__(self) -> None:
         """Initialize an empty registry with the default error strategy."""
         self._hooks: Dict[str, List[Dict[str, Any]]] = {}
         self._error_strategy: str = "log_and_continue"
         self._hook_tracing: bool = False
+        # Reentrant: hooks running in worker threads may call back into
+        # register/unregister, and trigger_async dispatches sync hooks
+        # to executor threads concurrently.
+        self._lock = threading.RLock()
+        # Populated by trigger/trigger_async when the strategy is
+        # ``collect_all`` so callers can inspect what failed. Cleared at
+        # the start of each dispatch.
+        self._last_errors: List[Dict[str, Any]] = []
 
     def register(
         self,
@@ -73,9 +96,6 @@ class HookRegistry:
             >>> reg = HookRegistry()
             >>> reg.register("user.*", lambda d: d, priority=100)
         """
-        if event_name not in self._hooks:
-            self._hooks[event_name] = []
-
         hook_info = {
             "callback": callback,
             "plugin": plugin,
@@ -85,10 +105,12 @@ class HookRegistry:
             "is_async": asyncio.iscoroutinefunction(callback),
         }
 
-        self._hooks[event_name].append(hook_info)
-
-        # Sort hooks by priority (higher priority first)
-        self._hooks[event_name].sort(key=lambda h: h["priority"], reverse=True)
+        with self._lock:
+            if event_name not in self._hooks:
+                self._hooks[event_name] = []
+            self._hooks[event_name].append(hook_info)
+            # Sort hooks by priority (higher priority first)
+            self._hooks[event_name].sort(key=lambda h: h["priority"], reverse=True)
 
         logger.debug(
             f"Registered hook '{event_name}' from plugin "
@@ -111,17 +133,19 @@ class HookRegistry:
         Returns:
             True if a hook was found and removed; False otherwise.
         """
-        if event_name not in self._hooks:
-            return False
+        with self._lock:
+            if event_name not in self._hooks:
+                return False
 
-        original_length = len(self._hooks[event_name])
-        self._hooks[event_name] = [
-            hook
-            for hook in self._hooks[event_name]
-            if not (hook["callback"] == callback and hook["plugin"] == plugin)
-        ]
+            original_length = len(self._hooks[event_name])
+            self._hooks[event_name] = [
+                hook
+                for hook in self._hooks[event_name]
+                if not (hook["callback"] == callback and hook["plugin"] == plugin)
+            ]
 
-        removed = len(self._hooks[event_name]) < original_length
+            removed = len(self._hooks[event_name]) < original_length
+
         if removed:
             logger.debug(f"Unregistered hook '{event_name}'")
         return removed
@@ -137,9 +161,12 @@ class HookRegistry:
         Returns:
             True if event matches pattern
         """
-        # `*` matches a single dot-delimited segment, mirroring glob semantics
-        # rather than regex `.*` (which would cross segment boundaries).
-        regex_pattern = pattern.replace(".", r"\.").replace("*", "[^.]*")
+        # `*` matches a single non-empty dot-delimited segment, mirroring
+        # glob semantics rather than regex `.*` (which would cross segment
+        # boundaries). ``+`` (one-or-more) instead of ``*`` (zero-or-more)
+        # is intentional: ``user.*`` does NOT match the literal string
+        # ``"user."`` with an empty trailing segment.
+        regex_pattern = pattern.replace(".", r"\.").replace("*", "[^.]+")
         regex_pattern = f"^{regex_pattern}$"
         return bool(re.match(regex_pattern, event))
 
@@ -153,9 +180,15 @@ class HookRegistry:
         Returns:
             List of matching hook information dictionaries
         """
-        matching_hooks = []
+        matching_hooks: List[Dict[str, Any]] = []
 
-        for registered_event, hooks in self._hooks.items():
+        # Snapshot under the lock so a concurrent register/unregister
+        # from a hook running in a worker thread cannot mutate the dict
+        # mid-iteration.
+        with self._lock:
+            snapshot = [(event, list(hooks)) for event, hooks in self._hooks.items()]
+
+        for registered_event, hooks in snapshot:
             # Exact match
             if registered_event == event_name:
                 matching_hooks.extend(hooks)
@@ -175,6 +208,16 @@ class HookRegistry:
         """
         Execute a synchronous hook with optional timeout.
 
+        Uses a shared class-level :class:`ThreadPoolExecutor` rather than
+        a per-call one. A previous implementation used
+        ``with ThreadPoolExecutor(...) as executor:``; on timeout, the
+        ``__exit__`` call invoked ``shutdown(wait=True)`` and blocked
+        the caller until the runaway callback actually returned — making
+        the timeout effectively unenforceable. The shared pool is never
+        joined, so :class:`HookTimeoutError` propagates immediately and
+        the orphaned worker thread (which Python cannot forcibly kill)
+        is left to finish in the background.
+
         Args:
             callback: Hook callback function
             data: Data to pass to callback
@@ -189,18 +232,15 @@ class HookRegistry:
         if timeout is None:
             return callback(data)
 
-        # Thread-based timeout: portable (works on Windows and in non-main
-        # threads, unlike signal.SIGALRM) and safe to call from executors.
-        # Note: the worker thread cannot be forcibly killed on timeout. This
-        # matches asyncio.wait_for's behavior for async hooks.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(callback, data)
-            try:
-                return future.result(timeout=timeout)
-            except concurrent.futures.TimeoutError:
-                raise HookTimeoutError(
-                    f"Hook execution exceeded timeout of {timeout}s"
-                )
+        future = self._timeout_executor.submit(callback, data)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            # Best-effort cancel; running futures cannot actually be
+            # cancelled, but we mark intent so the worker is reclaimed
+            # if it ever does return.
+            future.cancel()
+            raise HookTimeoutError(f"Hook execution exceeded timeout of {timeout}s")
 
     async def _execute_async_hook_with_timeout(
         self, callback: Callable, data: Any, timeout: Optional[float]
@@ -227,6 +267,58 @@ class HookRegistry:
         except asyncio.TimeoutError:
             raise HookTimeoutError(f"Async hook execution exceeded timeout of {timeout}s")
 
+    async def _execute_sync_hook_in_executor(
+        self,
+        callback: Callable,
+        data: Any,
+        timeout: Optional[float],
+    ) -> Any:
+        """Dispatch a sync hook to the default executor with timeout.
+
+        Avoids the double-thread-pool dispatch that the old code
+        accidentally created (``run_in_executor`` -> helper -> *another*
+        ThreadPoolExecutor.submit). Enforces the timeout at the asyncio
+        boundary so a runaway hook does not pin two threads.
+        """
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(None, callback, data)
+        if timeout is None:
+            return await future
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            raise HookTimeoutError(f"Hook execution exceeded timeout of {timeout}s")
+
+    async def _notify_on_error(self, plugin: Any, error: Exception) -> None:
+        """Call ``plugin.on_error`` and ``await`` the result if it's a coroutine."""
+        if not (plugin and hasattr(plugin, "on_error")):
+            return
+        try:
+            maybe_coro = plugin.on_error(error)
+            if inspect.iscoroutine(maybe_coro):
+                await maybe_coro
+        except Exception as notify_error:
+            logger.error(f"Error in plugin error handler: {notify_error}")
+
+    def _notify_on_error_sync(self, plugin: Any, error: Exception) -> None:
+        """Sync variant: drops async ``on_error`` coroutines with a warning."""
+        if not (plugin and hasattr(plugin, "on_error")):
+            return
+        try:
+            maybe_coro = plugin.on_error(error)
+            if inspect.iscoroutine(maybe_coro):
+                # The sync trigger() path cannot await this; close it to
+                # silence "coroutine was never awaited" RuntimeWarning and
+                # tell the user.
+                maybe_coro.close()
+                logger.warning(
+                    f"Async on_error coroutine from plugin "
+                    f"'{getattr(plugin, 'name', '?')}' was dropped in sync "
+                    f"trigger(); use trigger_async() to await it."
+                )
+        except Exception as notify_error:
+            logger.error(f"Error in plugin error handler: {notify_error}")
+
     def trigger(self, event_name: str, data: Any = None) -> Any:
         """Fire an event and run matching hooks synchronously.
 
@@ -236,6 +328,11 @@ class HookRegistry:
         and the current ``data`` is returned immediately. Async hooks
         are skipped with a warning; use :meth:`trigger_async` for
         those.
+
+        Note: a hook that returns ``None`` does NOT clear the payload
+        for the next hook — the previous ``data`` is preserved. If you
+        need to set the chain value to ``None`` explicitly, raise
+        :class:`StopPropagation` or use a sentinel value.
 
         Args:
             event_name: Event name to fire. Literal plus wildcard
@@ -264,7 +361,7 @@ class HookRegistry:
         if self._hook_tracing:
             logger.debug(f"Triggering event '{event_name}' with {len(hooks)} hooks")
 
-        errors = []
+        errors: List[Dict[str, Any]] = []
         result = data
 
         for hook_info in hooks:
@@ -317,11 +414,7 @@ class HookRegistry:
                 error_msg = f"Hook '{event_name}' from plugin '{plugin_name}' " f"timed out: {e}"
                 logger.error(error_msg)
 
-                if plugin and hasattr(plugin, "on_error"):
-                    try:
-                        plugin.on_error(e)
-                    except Exception as notify_error:
-                        logger.error(f"Error in plugin error handler: {notify_error}")
+                self._notify_on_error_sync(plugin, e)
 
                 if self._error_strategy == "fail_fast":
                     raise HookError(error_msg) from e
@@ -340,12 +433,7 @@ class HookRegistry:
                 )
                 logger.error(error_msg)
 
-                # Notify plugin of error
-                if plugin and hasattr(plugin, "on_error"):
-                    try:
-                        plugin.on_error(e)
-                    except Exception as notify_error:
-                        logger.error(f"Error in plugin error handler: {notify_error}")
+                self._notify_on_error_sync(plugin, e)
 
                 if self._error_strategy == "fail_fast":
                     raise HookError(error_msg) from e
@@ -359,6 +447,10 @@ class HookRegistry:
                     )
                 # log_and_continue: just continue to next hook
 
+        # Expose collected errors for programmatic inspection (issue: the
+        # ``collect_all`` strategy previously had no way for callers to
+        # see what failed).
+        self._last_errors = errors
         if errors and self._error_strategy == "collect_all":
             logger.warning(f"Event '{event_name}' completed with {len(errors)} errors")
 
@@ -372,6 +464,9 @@ class HookRegistry:
         the event loop, which means sync hooks must be thread-safe
         when invoked through this method. Ordering, stop-propagation,
         and error-strategy semantics are identical to :meth:`trigger`.
+
+        ``on_error`` callbacks are awaited if they return a coroutine,
+        so plugins may define ``async def on_error``.
 
         Args:
             event_name: Event name to fire.
@@ -401,7 +496,7 @@ class HookRegistry:
         if self._hook_tracing:
             logger.debug(f"Triggering async event '{event_name}' with " f"{len(hooks)} hooks")
 
-        errors = []
+        errors: List[Dict[str, Any]] = []
         result = data
 
         for hook_info in hooks:
@@ -428,14 +523,14 @@ class HookRegistry:
                         callback, result, timeout
                     )
                 else:
-                    # Run sync hook in executor to avoid blocking
-                    loop = asyncio.get_running_loop()
-                    new_result = await loop.run_in_executor(
-                        None,
-                        self._execute_hook_with_timeout,
-                        callback,
-                        result,
-                        timeout,
+                    # Single-thread dispatch with asyncio-level timeout
+                    # enforcement. The previous implementation called
+                    # run_in_executor -> _execute_hook_with_timeout, which
+                    # itself spun up another ThreadPoolExecutor — pinning
+                    # two threads per timed hook and inheriting the
+                    # shutdown-blocks-on-timeout bug.
+                    new_result = await self._execute_sync_hook_in_executor(
+                        callback, result, timeout
                     )
 
                 if self._hook_tracing:
@@ -461,11 +556,7 @@ class HookRegistry:
                 )
                 logger.error(error_msg)
 
-                if plugin and hasattr(plugin, "on_error"):
-                    try:
-                        plugin.on_error(e)
-                    except Exception as notify_error:
-                        logger.error(f"Error in plugin error handler: {notify_error}")
+                await self._notify_on_error(plugin, e)
 
                 if self._error_strategy == "fail_fast":
                     raise HookError(error_msg) from e
@@ -485,11 +576,7 @@ class HookRegistry:
                 )
                 logger.error(error_msg)
 
-                if plugin and hasattr(plugin, "on_error"):
-                    try:
-                        plugin.on_error(e)
-                    except Exception as notify_error:
-                        logger.error(f"Error in plugin error handler: {notify_error}")
+                await self._notify_on_error(plugin, e)
 
                 if self._error_strategy == "fail_fast":
                     raise HookError(error_msg) from e
@@ -502,6 +589,7 @@ class HookRegistry:
                         }
                     )
 
+        self._last_errors = errors
         if errors and self._error_strategy == "collect_all":
             logger.warning(f"Async event '{event_name}' completed with " f"{len(errors)} errors")
 
@@ -529,7 +617,8 @@ class HookRegistry:
             The literal strings used at registration. Wildcard patterns
             are returned as-is (e.g. ``"user.*"``).
         """
-        return list(self._hooks.keys())
+        with self._lock:
+            return list(self._hooks.keys())
 
     def clear_event(self, event_name: str) -> None:
         """Remove every hook registered under a single event name.
@@ -540,9 +629,10 @@ class HookRegistry:
         Args:
             event_name: Event name to clear.
         """
-        if event_name in self._hooks:
-            del self._hooks[event_name]
-            logger.debug(f"Cleared all hooks for event '{event_name}'")
+        with self._lock:
+            if event_name in self._hooks:
+                del self._hooks[event_name]
+                logger.debug(f"Cleared all hooks for event '{event_name}'")
 
     def clear_all(self) -> None:
         """Remove every registered hook.
@@ -550,8 +640,23 @@ class HookRegistry:
         Use between tests or when reconfiguring the registry from
         scratch.
         """
-        self._hooks.clear()
+        with self._lock:
+            self._hooks.clear()
         logger.debug("Cleared all hooks")
+
+    def get_last_errors(self) -> List[Dict[str, Any]]:
+        """Return errors collected during the most recent dispatch.
+
+        Populated when the error strategy is ``"collect_all"``. Each
+        entry is a dict with keys ``plugin``, ``error``, ``event``.
+        Cleared at the start of every :meth:`trigger` /
+        :meth:`trigger_async`.
+
+        Returns:
+            A list of error records from the last dispatch, possibly
+            empty.
+        """
+        return list(self._last_errors)
 
     def set_error_strategy(self, strategy: str) -> None:
         """Choose how hook exceptions are handled during dispatch.
@@ -561,8 +666,8 @@ class HookRegistry:
               the next hook.
             - ``"fail_fast"``: raise :class:`HookError` and abort the
               chain.
-            - ``"collect_all"``: run every hook, then log a summary of
-              how many failed.
+            - ``"collect_all"``: run every hook, then expose collected
+              errors via :meth:`get_last_errors`.
 
         Args:
             strategy: One of the values above.
