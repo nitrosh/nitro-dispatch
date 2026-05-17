@@ -5,7 +5,7 @@ import importlib.util
 import inspect
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Type, Union
 import logging
 
 from .plugin_base import PluginBase
@@ -20,6 +20,23 @@ from .exceptions import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Prefix under which ``discover_plugins`` stashes modules in ``sys.modules``.
+# Namespacing avoids clobbering stdlib or application modules that happen
+# to share a file stem (e.g. a plugin file called ``logging.py``).
+_DISCOVERED_MODULE_PREFIX = "nitro_dispatch._discovered."
+
+# importlib.reload() walks the parent package chain in sys.modules. Register
+# a stub for the synthetic ``nitro_dispatch._discovered`` namespace so
+# reload() of discovered plugin modules doesn't raise
+# ``ImportError: parent 'nitro_dispatch._discovered' not in sys.modules``.
+_DISCOVERED_PARENT = "nitro_dispatch._discovered"
+if _DISCOVERED_PARENT not in sys.modules:
+    import types as _types
+
+    _stub = _types.ModuleType(_DISCOVERED_PARENT)
+    _stub.__path__ = []  # mark as a (namespace) package
+    sys.modules[_DISCOVERED_PARENT] = _stub
 
 
 class PluginManager:
@@ -90,6 +107,9 @@ class PluginManager:
         self._config: Dict[str, Any] = config or {}
         self._loaded: bool = False
         self._validate_metadata: bool = validate_metadata
+        # Names currently mid-``load()``. Used to detect circular
+        # dependencies before they blow the Python recursion limit.
+        self._loading: Set[str] = set()
 
         logging.basicConfig(level=getattr(logging, log_level.upper()))
 
@@ -208,17 +228,47 @@ class PluginManager:
             logger.warning(f"Plugin '{plugin_name}' already loaded")
             return self._plugins[plugin_name]
 
-        plugin_class = self._plugin_classes[plugin_name]
+        # Cycle detection: if we're already mid-load for this plugin, the
+        # dependency graph has a cycle. Raise immediately instead of
+        # recursing until RecursionError.
+        if plugin_name in self._loading:
+            chain = " -> ".join(sorted(self._loading) + [plugin_name])
+            raise DependencyError(
+                f"Circular dependency detected while loading " f"'{plugin_name}' (chain: {chain})"
+            )
 
+        plugin_class = self._plugin_classes[plugin_name]
+        plugin: Optional[PluginBase] = None
+        hooks_registered: List[tuple] = []  # (event_name, callback) pairs
+
+        self._loading.add(plugin_name)
         try:
             plugin = plugin_class()
             plugin._manager = self
+
+            # Re-validate dependencies on the actual load-time instance.
+            # ``__init__`` may mutate ``self.dependencies`` based on
+            # environment, so the value seen at register() time can differ.
+            if not isinstance(plugin.dependencies, list):
+                raise ValidationError(
+                    f"Plugin '{plugin_name}' dependencies must be a list, "
+                    f"got {type(plugin.dependencies).__name__}"
+                )
+            for dep_name in plugin.dependencies:
+                if not isinstance(dep_name, str):
+                    raise ValidationError(
+                        f"Plugin '{plugin_name}' has non-string dependency: " f"{dep_name!r}"
+                    )
 
             for dep_name in plugin.dependencies:
                 if dep_name not in self._plugins:
                     logger.info(f"Loading dependency '{dep_name}' for '{plugin_name}'")
                     try:
                         self.load(dep_name)
+                    except DependencyError:
+                        # Already wrapped (cycle or upstream dep error);
+                        # surface as-is so the chain message survives.
+                        raise
                     except Exception as e:
                         raise DependencyError(
                             f"Failed to load dependency '{dep_name}' for " f"'{plugin_name}': {e}"
@@ -227,16 +277,19 @@ class PluginManager:
             for event_name, hook_list in plugin._hooks.items():
                 for hook_data in hook_list:
                     if isinstance(hook_data, dict):
+                        callback = hook_data["callback"]
                         self.register_hook(
                             event_name,
-                            hook_data["callback"],
+                            callback,
                             plugin,
                             hook_data.get("priority", 50),
                             hook_data.get("timeout"),
                         )
                     else:
                         # Legacy format: bare callable stored without metadata.
-                        self.register_hook(event_name, hook_data, plugin)
+                        callback = hook_data
+                        self.register_hook(event_name, callback, plugin)
+                    hooks_registered.append((event_name, callback))
 
             plugin.on_load()
             plugin.enabled = True
@@ -252,6 +305,16 @@ class PluginManager:
             return plugin
 
         except Exception as e:
+            # Roll back any partial state so the registry doesn't end up
+            # with orphan hooks pointing at an unloadable instance.
+            for event_name, callback in hooks_registered:
+                try:
+                    self._registry.unregister(event_name, callback, plugin)
+                except Exception:  # pragma: no cover - defensive
+                    pass
+            if plugin is not None:
+                plugin._manager = None
+
             error_data = {
                 "plugin_name": plugin_name,
                 "error": str(e),
@@ -259,6 +322,8 @@ class PluginManager:
             }
             self.trigger(self.EVENT_PLUGIN_ERROR, error_data)
             raise PluginLoadError(f"Failed to load plugin '{plugin_name}': {e}") from e
+        finally:
+            self._loading.discard(plugin_name)
 
     def load_all(self) -> List[str]:
         """Load every registered plugin, respecting dependencies.
@@ -313,25 +378,47 @@ class PluginManager:
             raise PluginNotFoundError(f"Plugin '{plugin_name}' not loaded")
 
         plugin = self._plugins[plugin_name]
+        on_unload_error: Optional[Exception] = None
 
+        # Call on_unload first, but don't let its failure leave the
+        # plugin half-detached. We capture the exception, run the full
+        # cleanup, and re-raise at the end.
         try:
             plugin.on_unload()
-            plugin.enabled = False
-
-            for event_name in self._registry.get_all_events():
-                hooks = self._registry.get_hooks(event_name)
-                for hook_info in hooks:
-                    if hook_info["plugin"] == plugin:
-                        self._registry.unregister(event_name, hook_info["callback"], plugin)
-
-            del self._plugins[plugin_name]
-            logger.info(f"Unloaded plugin '{plugin_name}'")
-
-            self.trigger(self.EVENT_PLUGIN_UNLOADED, {"plugin_name": plugin_name})
-
         except Exception as e:
-            logger.error(f"Error unloading plugin '{plugin_name}': {e}")
-            raise
+            on_unload_error = e
+            logger.error(
+                f"Error in on_unload for '{plugin_name}': {e} " f"(proceeding with hook detachment)"
+            )
+
+        plugin.enabled = False
+
+        # Detach hooks unconditionally. Snapshot first — get_hooks() may
+        # return the live list and we mutate it via unregister() in the
+        # loop, which would otherwise skip entries.
+        try:
+            for event_name in list(self._registry.get_all_events()):
+                hooks = list(self._registry.get_hooks(event_name))
+                for hook_info in hooks:
+                    if hook_info["plugin"] is plugin:
+                        self._registry.unregister(event_name, hook_info["callback"], plugin)
+        finally:
+            # Always drop the manager's reference, even if hook removal
+            # somehow raised. Leaving a stale entry in ``_plugins`` is
+            # worse than a possibly-orphan registry entry, because every
+            # subsequent unload() would re-fail on the same plugin.
+            self._plugins.pop(plugin_name, None)
+            plugin._manager = None
+
+        logger.info(f"Unloaded plugin '{plugin_name}'")
+
+        try:
+            self.trigger(self.EVENT_PLUGIN_UNLOADED, {"plugin_name": plugin_name})
+        except Exception as e:
+            logger.error(f"Error firing EVENT_PLUGIN_UNLOADED for '{plugin_name}': {e}")
+
+        if on_unload_error is not None:
+            raise on_unload_error
 
     def unload_all(self) -> None:
         """Unload every currently-loaded plugin.
@@ -373,28 +460,79 @@ class PluginManager:
 
         logger.info(f"Reloading plugin '{plugin_name}'")
 
+        plugin_class = self._plugin_classes[plugin_name]
+        module_name = getattr(plugin_class, "__module__", None)
+
+        # Find every other registered plugin that lives in the same
+        # module — they all become stale when importlib.reload() runs.
+        sibling_names = [
+            name
+            for name, cls in self._plugin_classes.items()
+            if name != plugin_name and getattr(cls, "__module__", None) == module_name
+        ]
+        # Track which siblings were loaded so we can restore them.
+        previously_loaded_siblings = [n for n in sibling_names if n in self._plugins]
+
+        # Unload the target first, then any loaded siblings, so the
+        # module reload doesn't strand instances of dead classes.
         if plugin_name in self._plugins:
             self.unload(plugin_name)
+        for sibling in previously_loaded_siblings:
+            try:
+                self.unload(sibling)
+            except Exception as e:
+                logger.error(f"Error unloading sibling '{sibling}' during reload: {e}")
 
-        plugin_class = self._plugin_classes[plugin_name]
-        if hasattr(plugin_class, "__module__"):
-            module_name = plugin_class.__module__
-            if module_name in sys.modules:
-                logger.debug(f"Reloading module '{module_name}'")
-                reloaded_module = importlib.reload(sys.modules[module_name])
+        if module_name and module_name in sys.modules:
+            logger.debug(f"Reloading module '{module_name}'")
+            existing = sys.modules[module_name]
+            spec = getattr(existing, "__spec__", None)
+            # Modules loaded via spec_from_file_location (discover_plugins
+            # and the ad-hoc case) can't always be reloaded through
+            # importlib.reload because their parent package isn't a real
+            # package on disk. Re-exec the saved spec instead when the
+            # module has a file origin; fall back to importlib.reload
+            # otherwise.
+            if (
+                spec is not None
+                and getattr(spec, "origin", None)
+                and spec.loader is not None
+                and module_name.startswith(_DISCOVERED_MODULE_PREFIX)
+            ):
+                new_module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = new_module
+                try:
+                    spec.loader.exec_module(new_module)
+                except Exception:
+                    # Restore the previous module on failure so we don't
+                    # leave sys.modules in a worse state than we found it.
+                    sys.modules[module_name] = existing
+                    raise
+                reloaded_module = new_module
+            else:
+                reloaded_module = importlib.reload(existing)
 
-                # importlib.reload replaces the module's classes with new
-                # objects. Refresh our stored class reference so the subsequent
-                # load() instantiates the new code, not the pre-reload class.
-                # Read the name from class attrs to avoid running __init__ on
-                # every PluginBase subclass in the module during reload.
-                for _, obj in inspect.getmembers(reloaded_module, inspect.isclass):
-                    if not issubclass(obj, PluginBase) or obj is PluginBase:
-                        continue
-                    candidate_name = obj.name if obj.__dict__.get("name") else obj.__name__
-                    if candidate_name == plugin_name:
-                        self._plugin_classes[plugin_name] = obj
-                        break
+            # importlib.reload replaces the module's classes with new
+            # objects. Refresh our stored class reference for the target
+            # AND every sibling, so subsequent load() calls instantiate
+            # the new code rather than the pre-reload classes.
+            # Read ``name`` from the class dict to avoid running __init__
+            # on every PluginBase subclass in the module.
+            refresh_targets = set(sibling_names) | {plugin_name}
+            for _, obj in inspect.getmembers(reloaded_module, inspect.isclass):
+                if not issubclass(obj, PluginBase) or obj is PluginBase:
+                    continue
+                candidate_name = obj.name if obj.__dict__.get("name") else obj.__name__
+                if candidate_name in refresh_targets:
+                    self._plugin_classes[candidate_name] = obj
+
+        # Reload any previously-loaded siblings before the target, so
+        # callers see the same loaded set after reload() returns.
+        for sibling in previously_loaded_siblings:
+            try:
+                self.load(sibling)
+            except Exception as e:
+                logger.error(f"Error reloading sibling '{sibling}': {e}")
 
         return self.load(plugin_name)
 
@@ -450,13 +588,30 @@ class PluginManager:
                 if not plugin_file.is_file():
                     continue
 
+                # Namespace the sys.modules key so a plugin file whose
+                # stem collides with a stdlib or app module (e.g.
+                # ``logging.py``) doesn't silently clobber the real one.
+                # Also include the file's absolute path hash so two
+                # discovered plugins with the same stem in different
+                # directories don't clash.
+                module_name = (
+                    f"{_DISCOVERED_MODULE_PREFIX}{plugin_file.stem}_"
+                    f"{abs(hash(str(plugin_file)))}"
+                )
+
                 try:
-                    module_name = plugin_file.stem
                     spec = importlib.util.spec_from_file_location(module_name, plugin_file)
                     if spec and spec.loader:
                         module = importlib.util.module_from_spec(spec)
                         sys.modules[module_name] = module
-                        spec.loader.exec_module(module)
+                        try:
+                            spec.loader.exec_module(module)
+                        except Exception:
+                            # Don't leave a half-executed module in
+                            # sys.modules — later reload() / imports of
+                            # the same path will get the broken object.
+                            sys.modules.pop(module_name, None)
+                            raise
 
                         for name, obj in inspect.getmembers(module, inspect.isclass):
                             if (

@@ -443,6 +443,7 @@ class ReloadablePlugin(PluginBase):
             # Bump mtime past filesystem's 1s resolution so importlib doesn't
             # treat the cached bytecode as still-fresh.
             import os
+
             future = plugin_file.stat().st_mtime + 2
             os.utime(plugin_file, (future, future))
 
