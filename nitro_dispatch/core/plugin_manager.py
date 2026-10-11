@@ -3,9 +3,10 @@
 import importlib
 import importlib.util
 import inspect
+import re
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Type, Union
 import logging
 
 from .plugin_base import PluginBase
@@ -83,7 +84,7 @@ class PluginManager:
     def __init__(
         self,
         config: Optional[Dict[str, Any]] = None,
-        log_level: str = "INFO",
+        log_level: Optional[str] = None,
         validate_metadata: bool = True,
     ) -> None:
         """Initialize the manager.
@@ -92,9 +93,10 @@ class PluginManager:
             config: Optional per-plugin configuration, keyed by plugin
                 name. Exposed to plugins via
                 :meth:`PluginBase.get_config`.
-            log_level: Root logging level applied via
-                ``logging.basicConfig``. Accepts the usual names
-                (``DEBUG``, ``INFO``, ``WARNING``, ``ERROR``).
+            log_level: Level for the ``nitro_dispatch`` logger (``DEBUG``,
+                ``INFO``, ``WARNING``, ``ERROR``). ``None`` (default)
+                leaves it alone. This never touches the root logger or
+                adds handlers; configure those in your application.
             validate_metadata: When True (default), every registered
                 plugin has its ``name``, ``version``, and
                 ``dependencies`` attributes validated. Disable for
@@ -105,13 +107,17 @@ class PluginManager:
         self._plugins: Dict[str, PluginBase] = {}
         self._plugin_classes: Dict[str, Type[PluginBase]] = {}
         self._config: Dict[str, Any] = config or {}
-        self._loaded: bool = False
         self._validate_metadata: bool = validate_metadata
-        # Names currently mid-``load()``. Used to detect circular
-        # dependencies before they blow the Python recursion limit.
-        self._loading: Set[str] = set()
+        # Names currently mid-``load()``, in recursion order. Used to
+        # detect circular dependencies before they blow the Python
+        # recursion limit, and to report the cycle.
+        self._loading: Dict[str, None] = {}
 
-        logging.basicConfig(level=getattr(logging, log_level.upper()))
+        if log_level is not None:
+            level = logging.getLevelName(log_level.upper())
+            if not isinstance(level, int):
+                raise ValueError(f"Unknown log level: {log_level!r}")
+            logging.getLogger("nitro_dispatch").setLevel(level)
 
     def register(self, plugin_class: Type[PluginBase], validate: bool = True) -> str:
         """Register a plugin class so it can later be loaded.
@@ -232,16 +238,16 @@ class PluginManager:
         # dependency graph has a cycle. Raise immediately instead of
         # recursing until RecursionError.
         if plugin_name in self._loading:
-            chain = " -> ".join(sorted(self._loading) + [plugin_name])
+            stack = list(self._loading)
+            chain = " -> ".join(stack[stack.index(plugin_name) :] + [plugin_name])
             raise DependencyError(
                 f"Circular dependency detected while loading " f"'{plugin_name}' (chain: {chain})"
             )
 
         plugin_class = self._plugin_classes[plugin_name]
         plugin: Optional[PluginBase] = None
-        hooks_registered: List[tuple] = []  # (event_name, callback) pairs
 
-        self._loading.add(plugin_name)
+        self._loading[plugin_name] = None
         try:
             plugin = plugin_class()
             plugin._manager = self
@@ -277,19 +283,16 @@ class PluginManager:
             for event_name, hook_list in plugin._hooks.items():
                 for hook_data in hook_list:
                     if isinstance(hook_data, dict):
-                        callback = hook_data["callback"]
                         self.register_hook(
                             event_name,
-                            callback,
+                            hook_data["callback"],
                             plugin,
                             hook_data.get("priority", 50),
                             hook_data.get("timeout"),
                         )
                     else:
                         # Legacy format: bare callable stored without metadata.
-                        callback = hook_data
-                        self.register_hook(event_name, callback, plugin)
-                    hooks_registered.append((event_name, callback))
+                        self.register_hook(event_name, hook_data, plugin)
 
             plugin.on_load()
             plugin.enabled = True
@@ -306,13 +309,10 @@ class PluginManager:
 
         except Exception as e:
             # Roll back any partial state so the registry doesn't end up
-            # with orphan hooks pointing at an unloadable instance.
-            for event_name, callback in hooks_registered:
-                try:
-                    self._registry.unregister(event_name, callback, plugin)
-                except Exception:  # pragma: no cover - defensive
-                    pass
+            # with orphan hooks pointing at an unloadable instance. This
+            # includes hooks the plugin registered itself in on_load().
             if plugin is not None:
+                self._registry.unregister_plugin(plugin)
                 plugin._manager = None
 
             error_data = {
@@ -323,7 +323,7 @@ class PluginManager:
             self.trigger(self.EVENT_PLUGIN_ERROR, error_data)
             raise PluginLoadError(f"Failed to load plugin '{plugin_name}': {e}") from e
         finally:
-            self._loading.discard(plugin_name)
+            self._loading.pop(plugin_name, None)
 
     def load_all(self) -> List[str]:
         """Load every registered plugin, respecting dependencies.
@@ -354,7 +354,6 @@ class PluginManager:
                     logger.error(f"Failed to load plugin '{plugin_name}': {e}")
                     failed_plugins.append(plugin_name)
 
-        self._loaded = True
         logger.info(f"Loaded {len(loaded_plugins)} plugins. " f"Failed: {len(failed_plugins)}")
 
         if failed_plugins:
@@ -393,15 +392,8 @@ class PluginManager:
 
         plugin.enabled = False
 
-        # Detach hooks unconditionally. Snapshot first — get_hooks() may
-        # return the live list and we mutate it via unregister() in the
-        # loop, which would otherwise skip entries.
         try:
-            for event_name in list(self._registry.get_all_events()):
-                hooks = list(self._registry.get_hooks(event_name))
-                for hook_info in hooks:
-                    if hook_info["plugin"] is plugin:
-                        self._registry.unregister(event_name, hook_info["callback"], plugin)
+            self._registry.unregister_plugin(plugin)
         finally:
             # Always drop the manager's reference, even if hook removal
             # somehow raised. Leaving a stale entry in ``_plugins`` is
@@ -433,7 +425,6 @@ class PluginManager:
             except Exception as e:
                 logger.error(f"Error unloading plugin '{plugin_name}': {e}")
 
-        self._loaded = False
         logger.info("Unloaded all plugins")
 
     def reload(self, plugin_name: str) -> PluginBase:
@@ -451,9 +442,15 @@ class PluginManager:
         Returns:
             The freshly-loaded plugin instance.
 
+        If the module fails to re-execute (a syntax error mid-edit, say),
+        the previously loaded plugins are loaded again from their old
+        classes before :class:`PluginLoadError` is raised, so a bad edit
+        doesn't leave them unloaded.
+
         Raises:
             PluginNotFoundError: If the plugin is not registered.
-            PluginLoadError: If the post-reload load fails.
+            PluginLoadError: If the module can't be re-executed, or the
+                post-reload load fails.
         """
         if plugin_name not in self._plugin_classes:
             raise PluginNotFoundError(f"Plugin '{plugin_name}' not registered")
@@ -473,9 +470,11 @@ class PluginManager:
         # Track which siblings were loaded so we can restore them.
         previously_loaded_siblings = [n for n in sibling_names if n in self._plugins]
 
+        was_loaded = plugin_name in self._plugins
+
         # Unload the target first, then any loaded siblings, so the
         # module reload doesn't strand instances of dead classes.
-        if plugin_name in self._plugins:
+        if was_loaded:
             self.unload(plugin_name)
         for sibling in previously_loaded_siblings:
             try:
@@ -485,32 +484,17 @@ class PluginManager:
 
         if module_name and module_name in sys.modules:
             logger.debug(f"Reloading module '{module_name}'")
-            existing = sys.modules[module_name]
-            spec = getattr(existing, "__spec__", None)
-            # Modules loaded via spec_from_file_location (discover_plugins
-            # and the ad-hoc case) can't always be reloaded through
-            # importlib.reload because their parent package isn't a real
-            # package on disk. Re-exec the saved spec instead when the
-            # module has a file origin; fall back to importlib.reload
-            # otherwise.
-            if (
-                spec is not None
-                and getattr(spec, "origin", None)
-                and spec.loader is not None
-                and module_name.startswith(_DISCOVERED_MODULE_PREFIX)
-            ):
-                new_module = importlib.util.module_from_spec(spec)
-                sys.modules[module_name] = new_module
-                try:
-                    spec.loader.exec_module(new_module)
-                except Exception:
-                    # Restore the previous module on failure so we don't
-                    # leave sys.modules in a worse state than we found it.
-                    sys.modules[module_name] = existing
-                    raise
-                reloaded_module = new_module
-            else:
-                reloaded_module = importlib.reload(existing)
+            try:
+                reloaded_module = self._reexec_module(module_name)
+            except Exception as e:
+                logger.error(f"Reloading module '{module_name}' failed: {e}")
+                restore = previously_loaded_siblings + ([plugin_name] if was_loaded else [])
+                for name in restore:
+                    try:
+                        self.load(name)
+                    except Exception as restore_error:
+                        logger.error(f"Error restoring '{name}' after reload: {restore_error}")
+                raise PluginLoadError(f"Failed to reload plugin '{plugin_name}': {e}") from e
 
             # importlib.reload replaces the module's classes with new
             # objects. Refresh our stored class reference for the target
@@ -535,6 +519,34 @@ class PluginManager:
                 logger.error(f"Error reloading sibling '{sibling}': {e}")
 
         return self.load(plugin_name)
+
+    def _reexec_module(self, module_name: str) -> Any:
+        """Re-execute a plugin's module and return the fresh module object."""
+        existing = sys.modules[module_name]
+        spec = getattr(existing, "__spec__", None)
+        # Modules loaded via spec_from_file_location (discover_plugins
+        # and the ad-hoc case) can't always be reloaded through
+        # importlib.reload because their parent package isn't a real
+        # package on disk. Re-exec the saved spec instead when the
+        # module has a file origin; fall back to importlib.reload
+        # otherwise.
+        if (
+            spec is not None
+            and getattr(spec, "origin", None)
+            and spec.loader is not None
+            and module_name.startswith(_DISCOVERED_MODULE_PREFIX)
+        ):
+            new_module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = new_module
+            try:
+                spec.loader.exec_module(new_module)
+            except Exception:
+                # Restore the previous module on failure so we don't
+                # leave sys.modules in a worse state than we found it.
+                sys.modules[module_name] = existing
+                raise
+            return new_module
+        return importlib.reload(existing)
 
     def discover_plugins(
         self,
@@ -594,9 +606,12 @@ class PluginManager:
                 # Also include the file's absolute path hash so two
                 # discovered plugins with the same stem in different
                 # directories don't clash.
+                # Non-identifier characters (dots especially) would turn
+                # the stem into a nested module path under a parent that
+                # doesn't exist.
+                safe_stem = re.sub(r"\W", "_", plugin_file.stem)
                 module_name = (
-                    f"{_DISCOVERED_MODULE_PREFIX}{plugin_file.stem}_"
-                    f"{abs(hash(str(plugin_file)))}"
+                    f"{_DISCOVERED_MODULE_PREFIX}{safe_stem}_" f"{abs(hash(str(plugin_file)))}"
                 )
 
                 try:
@@ -832,7 +847,8 @@ class PluginManager:
               the next hook.
             - ``"fail_fast"``: raise :class:`HookError` and abort the
               chain.
-            - ``"collect_all"``: run every hook, then log a summary.
+            - ``"collect_all"``: run every hook, then expose collected
+              errors via :meth:`get_last_errors`.
 
         Args:
             strategy: One of the values above.
@@ -842,12 +858,28 @@ class PluginManager:
         """
         self._registry.set_error_strategy(strategy)
 
+    def get_last_errors(self) -> List[Dict[str, Any]]:
+        """Return errors collected during the most recent dispatch.
+
+        Populated when the error strategy is ``"collect_all"``. Each
+        entry is a dict with keys ``plugin``, ``error``, ``event``.
+        Lifecycle events the manager fires itself (on register, load,
+        unload) count as dispatches too, so read this straight after
+        the :meth:`trigger` you care about.
+
+        Returns:
+            A list of error records, possibly empty.
+        """
+        return self._registry.get_last_errors()
+
     def enable_hook_tracing(self, enabled: bool = True) -> None:
         """Toggle per-hook timing logs for debugging.
 
         When enabled, every dispatch logs the elapsed time of each
-        hook at DEBUG level. Combine with ``log_level="DEBUG"`` on
-        the manager to actually see the output.
+        hook at DEBUG level. To see the output, pass
+        ``log_level="DEBUG"`` to the manager and make sure your
+        application has a handler configured (e.g.
+        ``logging.basicConfig(level=logging.DEBUG)``).
 
         Args:
             enabled: True to turn tracing on, False to turn it off.

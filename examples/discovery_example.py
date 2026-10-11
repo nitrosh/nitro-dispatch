@@ -4,8 +4,7 @@ Plugin discovery demonstration.
 This example shows how to auto-discover plugins from a directory.
 """
 
-from nitro_dispatch import PluginManager, PluginBase, hook
-import os
+from nitro_dispatch import PluginManager
 import tempfile
 from pathlib import Path
 

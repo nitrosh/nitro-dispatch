@@ -14,6 +14,7 @@ See `discovery_example.py` for plugin discovery and hot reloading.
 """
 
 import asyncio
+import logging
 import time
 from nitro_dispatch import PluginManager, PluginBase, hook, StopPropagation
 
@@ -252,6 +253,11 @@ def demo_hook_tracing():
     print("DEMO 5: Hook Tracing (Debugging)")
     print("=" * 60)
 
+    # The library never configures logging itself, so attach a handler
+    # to see the trace output.
+    handler = logging.StreamHandler()
+    logging.getLogger("nitro_dispatch").addHandler(handler)
+
     manager = PluginManager(log_level="DEBUG")
     manager.enable_hook_tracing(True)
     manager.register(HighPriorityPlugin)
@@ -259,8 +265,11 @@ def demo_hook_tracing():
     manager.load_all()
 
     print("\nWith hook tracing enabled:")
-    result = manager.trigger("user.login", {"username": "bob"})
+    manager.trigger("user.login", {"username": "bob"})
     print()
+
+    logging.getLogger("nitro_dispatch").removeHandler(handler)
+    logging.getLogger("nitro_dispatch").setLevel(logging.NOTSET)
 
 
 def demo_built_in_events():

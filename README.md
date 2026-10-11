@@ -173,6 +173,8 @@ def slow_process(self, data):
     return data
 ```
 
+Python can't kill a thread, so a sync hook that times out keeps running in the background on a daemon thread. The chain moves on without waiting for it, and it won't stop your process from exiting.
+
 ### Event Namespacing with Wildcards
 
 Organize events hierarchically and use wildcards:
@@ -277,10 +279,13 @@ manager.register_hook(
 
 ### Hook Tracing/Debugging
 
-Enable detailed logging for debugging:
+Enable detailed logging for debugging. Nitro Dispatch never configures logging for you, so your app needs a handler:
 
 ```python
-manager = PluginManager(log_level='DEBUG')
+import logging
+
+logging.basicConfig()
+manager = PluginManager(log_level='DEBUG')  # sets the 'nitro_dispatch' logger level
 manager.enable_hook_tracing(True)
 
 # Now all hook executions are logged with timing info
@@ -300,6 +305,8 @@ manager.set_error_strategy('fail_fast')
 
 # Collect all errors
 manager.set_error_strategy('collect_all')
+manager.trigger('user.login', {})
+errors = manager.get_last_errors()  # [{'plugin', 'error', 'event'}, ...]
 ```
 
 ### Plugin Configuration
@@ -352,6 +359,7 @@ class CachePlugin(PluginBase):
 | `disable_plugin(name)`                                      | Disable a plugin                |
 | `enable_hook_tracing(enabled)`                              | Enable debugging                |
 | `set_error_strategy(strategy)`                              | Set error handling              |
+| `get_last_errors()`                                         | Errors from the last trigger    |
 
 ### PluginBase
 

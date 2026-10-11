@@ -44,7 +44,6 @@ def test_manager_initialization():
     manager = PluginManager()
     assert manager._plugins == {}
     assert manager._plugin_classes == {}
-    assert manager._loaded is False
 
 
 def test_manager_with_config():

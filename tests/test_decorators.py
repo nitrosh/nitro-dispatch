@@ -2,7 +2,7 @@
 Tests for Nitro Dispatch decorators.
 """
 
-import asyncio
+import inspect
 import pytest
 from nitro_dispatch.utils.decorators import hook
 from nitro_dispatch import PluginBase
@@ -65,7 +65,7 @@ def test_hook_decorator_async():
 
     plugin = TestPlugin()
     assert plugin.async_hook._is_async is True
-    assert asyncio.iscoroutinefunction(plugin.async_hook)
+    assert inspect.iscoroutinefunction(plugin.async_hook)
 
 
 def test_hook_decorator_sync():

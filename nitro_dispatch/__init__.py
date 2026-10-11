@@ -34,9 +34,11 @@ Example:
     result = manager.trigger('before_save', {'key': 'value'})
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __author__ = "Sean Nieuwoudt"
 __license__ = "MIT"
+
+import logging
 
 from .core import (
     PluginBase,
@@ -71,3 +73,5 @@ __all__ = [
     "ValidationError",
     "PluginDiscoveryError",
 ]
+
+logging.getLogger(__name__).addHandler(logging.NullHandler())

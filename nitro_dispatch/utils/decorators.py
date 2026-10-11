@@ -1,8 +1,8 @@
 """Decorators for declaring plugin hooks."""
 
-import asyncio
+import inspect
 from functools import wraps
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 
 def hook(
@@ -60,7 +60,9 @@ def hook(
                 f"'{getattr(func, '_event_name', '<unknown>')}'."
             )
 
-        is_async = async_hook or asyncio.iscoroutinefunction(func)
+        is_async = async_hook or inspect.iscoroutinefunction(func)
+
+        wrapper: Callable[..., Any]
 
         if is_async:
 
@@ -79,11 +81,13 @@ def hook(
             wrapper = sync_wrapper
 
         # Mark the function as a hook with metadata
-        wrapper._is_hook = True
-        wrapper._event_name = event_name
-        wrapper._priority = priority
-        wrapper._timeout = timeout
-        wrapper._is_async = is_async
+        wrapper.__dict__.update(
+            _is_hook=True,
+            _event_name=event_name,
+            _priority=priority,
+            _timeout=timeout,
+            _is_async=is_async,
+        )
 
         return wrapper
 

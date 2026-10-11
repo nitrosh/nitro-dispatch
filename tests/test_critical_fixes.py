@@ -13,11 +13,7 @@ import time
 import pytest
 
 from nitro_dispatch import PluginBase, PluginManager, hook
-from nitro_dispatch.core.exceptions import (
-    DependencyError,
-    HookTimeoutError,
-    PluginLoadError,
-)
+from nitro_dispatch.core.exceptions import PluginLoadError
 from nitro_dispatch.core.hook_registry import HookRegistry
 
 
